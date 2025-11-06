@@ -11,7 +11,11 @@ import requests
 from flask import Flask, jsonify, redirect, request, send_from_directory
 
 PORT = int(os.getenv("PORT", "8000"))
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")  # points at the compose service
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_USERNAME = os.getenv("REDIS_USERNAME")
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI", f"http://localhost:{PORT}/oauth/callback")
@@ -23,7 +27,16 @@ GOOGLE_DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files?uplo
 if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
     raise SystemExit("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in the environment.")
 
-r = redis.from_url(REDIS_URL)
+if not REDIS_HOST:
+    raise SystemExit("Set REDIS_HOST in the environment.")
+
+r = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    username=REDIS_USERNAME or None,
+    password=REDIS_PASSWORD or None,
+    db=REDIS_DB,
+)
 app = Flask(__name__, static_folder=".", static_url_path="")
 
 
