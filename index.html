@@ -1,175 +1,163 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Decoder Ring</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; background:#fafafa; color:#111; padding:30px; }
-    label { font-weight:600; margin-right:8px; }
-    input, button { font: inherit; padding:8px 10px; margin-right:8px; }
-    input { width:300px; max-width:90vw; }
-    button { cursor:pointer; background:#2563eb; color:#fff; border:0; border-radius:4px; }
-    #status { margin-top:15px; white-space:pre-wrap; font-family:monospace; }
-    .overlay { position:fixed; inset:0; background:rgba(0,0,0,0.5); display:grid; place-items:center; z-index:9999; }
-    .panel { background:#fff; color:#111; padding:16px 20px; border-radius:8px; box-shadow:0 4px 16px rgba(0,0,0,0.3); width:min(420px,90vw); text-align:center; }
-  </style>
-</head>
-<body>
-  <label for="name">Filename:</label>
-  <input id="name" type="text" placeholder="" />
-  <button id="go">Submit</button>
-  <div id="status"></div>
-
-<script>
-(function(){
-  const nameEl = document.getElementById('name');
-  const goEl = document.getElementById('go');
-  const statusEl = document.getElementById('status');
-
-  function setStatus(msg){ statusEl.textContent = msg; }
-
-  function openPasteOverlay(){
-    return new Promise((resolve, reject) => {
-      const overlay = document.createElement('div');
-      overlay.className = 'overlay';
-      overlay.innerHTML = `
-        <div class="panel">
-          <div>Press <b>Ctrl+V</b> (or Cmd+V) now.<br>Press <b>Esc</b> to cancel.</div>
-        </div>`;
-      document.body.appendChild(overlay);
-
-      function onPaste(e){
-        e.preventDefault();
-        const text = e.clipboardData.getData('text');
-        cleanup(); resolve(text || "");
+  <head>
+    <meta charset="utf-8" />
+    <title>Decoder Ring</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          Roboto,
+          Arial;
+        background: #fafafa;
+        color: #111;
+        padding: 30px;
       }
-      function onKey(e){
-        if (e.key === 'Escape'){ cleanup(); reject(new Error('cancelled')); }
+      button {
+        font: inherit;
+        padding: 8px 10px;
+        cursor: pointer;
+        background: #2563eb;
+        color: #fff;
+        border: 0;
+        border-radius: 4px;
       }
-      function cleanup(){
-        overlay.removeEventListener('paste', onPaste);
-        window.removeEventListener('keydown', onKey);
-        document.body.removeChild(overlay);
+      #status {
+        margin-top: 15px;
+        white-space: pre-wrap;
+        font-family: monospace;
       }
-      overlay.addEventListener('paste', onPaste);
-      window.addEventListener('keydown', onKey);
-      overlay.tabIndex = -1;
-      overlay.focus({ preventScroll: true });
-    });
-  }
+      .overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.5);
+        display: grid;
+        place-items: center;
+        z-index: 9999;
+      }
+      .panel {
+        background: #fff;
+        color: #111;
+        padding: 16px 20px;
+        border-radius: 8px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+        width: min(420px, 90vw);
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="go">Submit</button>
+    <div id="status"></div>
 
-  function extractBase64(text){
-    const s = text.trim();
-    const i = s.indexOf('base64,');
-    if (i >= 0 && s.startsWith('data:')) return s.slice(i + 7).replace(/\s+/g, '');
-    return s.replace(/\s+/g, '');
-  }
+    <script>
+      (async () => {
+        const go = document.getElementById("go");
+        const statusEl = document.getElementById("status");
+        const setStatus = (m) => (statusEl.textContent = m);
 
-  async function chunkedSend(base64Text, onProgress){
-    const startResp = await fetch('/api/chunk/start', { method: 'POST' });
-    const startJs = await startResp.json();
-    if (!startResp.ok || !startJs.ok) throw new Error(startJs.error || 'start failed');
-    const upload_id = startJs.upload_id;
+        go.addEventListener("click", async () => {
+          try {
+            setStatus("Waiting…");
+            const raw = await openPasteOverlay();
+            if (!raw) {
+              setStatus("No data.");
+              return;
+            }
 
-    const CHUNK = 512 * 1024; // 512 KB per request
-    const total = base64Text.length;
-    let seq = 0;
-    for (let off = 0; off < total; off += CHUNK) {
-      const data = base64Text.slice(off, Math.min(total, off + CHUNK));
-      const resp = await fetch('/api/chunk/append', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ upload_id, seq, data })
-      });
-      const js = await resp.json();
-      if (!resp.ok || !js.ok) throw new Error(js.error || 'append failed');
-      seq++;
-      if (onProgress) onProgress(Math.min(1, (off + data.length) / total));
-    }
-    return upload_id;
-  }
+            // Split off filename header
+            let name = "file.bin";
+            let base64 = raw.trim();
+            const m = /^FILENAME:(.+)\n([\s\S]*)$/.exec(base64);
+            if (m) {
+              name = m[1].trim();
+              base64 = m[2].trim();
+            }
 
-  async function finishDrive(upload_id, name){
-    const mime = 'application/octet-stream';
-    const resp = await fetch('/api/chunk/finish/drive', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ upload_id, name: name || 'file.bin', mime })
-    });
-    const js = await resp.json().catch(() => ({}));
-    if (!resp.ok || !js.ok) throw new Error((js && js.error) || resp.statusText || 'finish failed');
-    return js;
-  }
+            const upload_id = await chunkedSend(base64, (p) =>
+              setStatus(`Encoding ${(p * 100).toFixed(1)}% (${name})`)
+            );
 
-  // Authorization helper: open popup and poll /api/status until authed
-  async function ensureAuthorized(timeoutMs = 120000, intervalMs = 2000){
-    setStatus('Authorization required');
-    let popup = null;
-    try {
-      popup = window.open('/oauth/start', 'gdrive_auth', 'width=500,height=650');
-    } catch(e) {
-      // popup blocked; navigate current tab
-      location.href = '/oauth/start';
-      return new Promise(()=>{}); // stop further execution in this click flow
-    }
+            const res = await finishDrive(upload_id, name);
+            setStatus(`✅ Encoded "${res.name}" (id ${res.id}).`);
+          } catch (e) {
+            setStatus("Error: " + (e.message || e));
+          }
+        });
 
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      await new Promise(r => setTimeout(r, intervalMs));
-      try {
-        const s = await fetch('/api/status', { credentials: 'include' });
-        const js = await s.json();
-        if (js && js.authed) {
-          try { if (popup && !popup.closed) popup.close(); } catch {}
-          setStatus('Authorized; continuing…');
-          return true;
+        // Reuse previous chunked upload functions
+        async function chunkedSend(base64Text, onProgress) {
+          const start = await fetch("/api/chunk/start", { method: "POST" });
+          const sjs = await start.json();
+          if (!start.ok || !sjs.ok)
+            throw new Error(sjs.error || "start failed");
+          const upload_id = sjs.upload_id;
+          const CHUNK = 512 * 1024;
+          const total = base64Text.length;
+          let seq = 0;
+          for (let off = 0; off < total; off += CHUNK) {
+            const data = base64Text.slice(off, off + CHUNK);
+            const resp = await fetch("/api/chunk/append", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ upload_id, seq, data }),
+            });
+            const js = await resp.json();
+            if (!resp.ok || !js.ok)
+              throw new Error(js.error || "append failed");
+            seq++;
+            if (onProgress)
+              onProgress(Math.min(1, (off + data.length) / total));
+          }
+          return upload_id;
         }
-      } catch {}
-      // continue polling
-    }
-    try { if (popup && !popup.closed) popup.close(); } catch {}
-    throw new Error('authorization_timeout');
-  }
 
-  goEl.addEventListener('click', async () => {
-    try {
-      setStatus('Waiting…');
-      const text = await openPasteOverlay();
-      if (!text) { setStatus('No data detected.'); return; }
+        async function finishDrive(upload_id, name) {
+          const mime = "application/octet-stream";
+          const resp = await fetch("/api/chunk/finish/drive", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ upload_id, name, mime }),
+          });
+          const js = await resp.json().catch(() => ({}));
+          if (!resp.ok || !js.ok) throw new Error(js.error || resp.statusText);
+          return js;
+        }
 
-      const base64 = extractBase64(text);
-      if (!base64) { setStatus('Invalid data.'); return; }
-
-      const dest = (nameEl.value || 'file.bin').trim();
-      setStatus('Starting upload…');
-
-      const upload_id = await chunkedSend(base64, p => setStatus(`Uploading ${(p*100).toFixed(1)}%`));
-
-      setStatus('Decoding…');
-      try {
-        const res = await finishDrive(upload_id, dest);
-        setStatus(`Decoded "${res.name}" (id ${res.id}).`);
-        return;
-      } catch (e) {
-        if (!(String(e.message || e).includes('not_authed'))) throw e;
-      }
-
-      // If we get here, we are not authorized. Trigger auth flow, then retry once.
-      await ensureAuthorized();
-      const res2 = await finishDrive(upload_id, dest);
-      setStatus(`Decoded "${res2.name}" (id ${res2.id}).`);
-    } catch (e) {
-      if (String(e).includes('cancelled')) {
-        setStatus('Cancelled.');
-      } else if (String(e).includes('authorization_timeout')) {
-        setStatus('Authorization timed out. Try again.');
-      } else {
-        setStatus('Error: ' + (e.message || e));
-      }
-    }
-  });
-})();
-</script>
-</body>
+        function openPasteOverlay() {
+          return new Promise((resolve, reject) => {
+            const o = document.createElement("div");
+            o.className = "overlay";
+            o.innerHTML =
+              '<div class="panel">Go for it!</div>';
+            document.body.appendChild(o);
+            function done(t) {
+              cleanup();
+              resolve(t);
+            }
+            function cleanup() {
+              o.remove();
+              window.removeEventListener("keydown", key);
+            }
+            function key(e) {
+              if (e.key === "Escape") {
+                cleanup();
+                reject(new Error("cancelled"));
+              }
+            }
+            o.addEventListener("paste", (e) => {
+              e.preventDefault();
+              done(e.clipboardData.getData("text"));
+            });
+            window.addEventListener("keydown", key);
+            o.tabIndex = -1;
+            o.focus();
+          });
+        }
+      })();
+    </script>
+  </body>
 </html>
