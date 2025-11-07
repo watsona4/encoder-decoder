@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     environment:
-      REDIRECT_URI: https://b64drive.battenkillwoodworks.com/oauth/callback
+      REDIRECT_URI: https://decode.battenkillwoodworks.com/oauth/callback
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/status"]
       interval: 10s

@@ -54,7 +54,7 @@
     <div id="status"></div>
 
     <script>
-      (async () => {
+      (function () {
         const go = document.getElementById("go");
         const statusEl = document.getElementById("status");
         const setStatus = (m) => (statusEl.textContent = m);
@@ -68,38 +68,57 @@
               return;
             }
 
-            // Split off filename header
-            let name = "file.bin";
-            let base64 = raw.trim();
-            const m = /^FILENAME:(.+)\n([\s\S]*)$/.exec(base64);
-            if (m) {
-              name = m[1].trim();
-              base64 = m[2].trim();
-            }
+            // Extract filename header
+            const parsed = parseHeader(raw);
+            let { name, base64 } = parsed;
 
             const upload_id = await chunkedSend(base64, (p) =>
               setStatus(`Encoding ${(p * 100).toFixed(1)}% (${name})`)
             );
 
-            const res = await finishDrive(upload_id, name);
+            // Try to finish. If not authorized, run auth automatically, then retry once.
+            let res;
+            try {
+              res = await finishDrive(upload_id, name);
+            } catch (e) {
+              if (!String(e.message || e).includes("not_authed")) throw e;
+              await ensureAuthorized();
+              res = await finishDrive(upload_id, name);
+            }
             setStatus(`✅ Encoded "${res.name}" (id ${res.id}).`);
           } catch (e) {
-            setStatus("Error: " + (e.message || e));
+            if (String(e).includes("cancelled")) setStatus("Cancelled.");
+            else if (String(e).includes("authorization_timeout"))
+              setStatus("Authorization timed out. Try again.");
+            else setStatus("Error: " + (e.message || e));
           }
         });
 
-        // Reuse previous chunked upload functions
+        function parseHeader(text) {
+          const s = text.trim();
+          const m = /^FILENAME:(.+)\n([\s\S]*)$/.exec(s);
+          if (m) return { name: m[1].trim(), base64: normalizeB64(m[2]) };
+          return { name: "file.bin", base64: normalizeB64(s) };
+        }
+        function normalizeB64(t) {
+          // allow data URLs as well
+          const i = t.indexOf("base64,");
+          const payload = i >= 0 && t.startsWith("data:") ? t.slice(i + 7) : t;
+          return payload.replace(/\s+/g, "");
+        }
+
         async function chunkedSend(base64Text, onProgress) {
           const start = await fetch("/api/chunk/start", { method: "POST" });
           const sjs = await start.json();
           if (!start.ok || !sjs.ok)
             throw new Error(sjs.error || "start failed");
           const upload_id = sjs.upload_id;
+
           const CHUNK = 512 * 1024;
           const total = base64Text.length;
           let seq = 0;
           for (let off = 0; off < total; off += CHUNK) {
-            const data = base64Text.slice(off, off + CHUNK);
+            const data = base64Text.slice(off, Math.min(total, off + CHUNK));
             const resp = await fetch("/api/chunk/append", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -123,8 +142,46 @@
             body: JSON.stringify({ upload_id, name, mime }),
           });
           const js = await resp.json().catch(() => ({}));
-          if (!resp.ok || !js.ok) throw new Error(js.error || resp.statusText);
+          if (!resp.ok || !js.ok)
+            throw new Error(
+              (js && js.error) || resp.statusText || "finish failed"
+            );
           return js;
+        }
+
+        // Launch auth automatically and wait until authorized
+        async function ensureAuthorized(timeoutMs = 120000, intervalMs = 2000) {
+          setStatus("Authorization required. Opening Google consent…");
+          let popup = null;
+          try {
+            popup = window.open(
+              "/oauth/start",
+              "gdrive_auth",
+              "width=500,height=650"
+            );
+          } catch {
+            location.href = "/oauth/start";
+            return new Promise(() => {});
+          }
+          const start = Date.now();
+          while (Date.now() - start < timeoutMs) {
+            await new Promise((r) => setTimeout(r, intervalMs));
+            try {
+              const s = await fetch("/api/status", { credentials: "include" });
+              const js = await s.json();
+              if (js && js.authed) {
+                try {
+                  if (popup && !popup.closed) popup.close();
+                } catch {}
+                setStatus("Authorized. Continuing…");
+                return true;
+              }
+            } catch {}
+          }
+          try {
+            if (popup && !popup.closed) popup.close();
+          } catch {}
+          throw new Error("authorization_timeout");
         }
 
         function openPasteOverlay() {
@@ -134,15 +191,11 @@
             o.innerHTML =
               '<div class="panel">Go for it!</div>';
             document.body.appendChild(o);
-            function done(t) {
-              cleanup();
-              resolve(t);
-            }
             function cleanup() {
               o.remove();
-              window.removeEventListener("keydown", key);
+              window.removeEventListener("keydown", onKey);
             }
-            function key(e) {
+            function onKey(e) {
               if (e.key === "Escape") {
                 cleanup();
                 reject(new Error("cancelled"));
@@ -150,9 +203,11 @@
             }
             o.addEventListener("paste", (e) => {
               e.preventDefault();
-              done(e.clipboardData.getData("text"));
+              const t = e.clipboardData.getData("text");
+              cleanup();
+              resolve(t || "");
             });
-            window.addEventListener("keydown", key);
+            window.addEventListener("keydown", onKey);
             o.tabIndex = -1;
             o.focus();
           });
