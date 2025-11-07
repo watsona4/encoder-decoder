@@ -1,293 +1,175 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>Base64 → File (Local or Drive via Redis-backed server)</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-      :root {
-        --bg: #0f172a;
-        --panel: #111827;
-        --text: #e5e7eb;
-        --muted: #94a3b8;
-        --ok: #22c55e;
-        --warn: #f59e0b;
-        --err: #ef4444;
-        --accent: #2563eb;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-        background: var(--bg);
-        color: var(--text);
-        font:
-          16px/1.45 system-ui,
-          -apple-system,
-          Segoe UI,
-          Roboto,
-          Arial,
-          sans-serif;
-      }
-      .card {
-        width: min(900px, 92vw);
-        background: var(--panel);
-        border: 1px solid #1f2937;
-        border-radius: 12px;
-        padding: 20px;
-      }
-      h1 {
-        margin: 0 0 6px;
-        font-size: 22px;
-      }
-      p {
-        margin: 0.2rem 0 1rem;
-        color: var(--muted);
-      }
-      .row {
-        display: flex;
-        gap: 10px;
-        flex-wrap: wrap;
-        align-items: center;
-      }
-      textarea {
-        width: 100%;
-        height: 180px;
-        resize: vertical;
-        background: #0b1220;
-        color: var(--text);
-        border: 1px solid #263043;
-        border-radius: 8px;
-        padding: 10px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      }
-      input[type="text"] {
-        background: #0b1220;
-        color: var(--text);
-        border: 1px solid #263043;
-        border-radius: 8px;
-        padding: 10px;
-      }
-      .btn {
-        appearance: none;
-        border: 0;
-        border-radius: 8px;
-        padding: 10px 14px;
-        font-weight: 600;
-        color: white;
-        background: var(--accent);
-        cursor: pointer;
-      }
-      .btn.secondary {
-        background: #374151;
-      }
-      .btn:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
-      }
-      .status {
-        margin-top: 10px;
-        padding: 10px;
-        border-radius: 8px;
-        background: #0b1220;
-        border: 1px solid #263043;
-        white-space: pre-wrap;
-        word-break: break-word;
-      }
-      .ok {
-        color: var(--ok);
-      }
-      .warn {
-        color: var(--warn);
-      }
-      .err {
-        color: var(--err);
-      }
-      label {
-        color: var(--muted);
-      }
-      .grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 10px;
-      }
-      @media (max-width: 720px) {
-        .grid {
-          grid-template-columns: 1fr;
-        }
-      }
-    </style>
-  </head>
-  <body>
-    <div class="card">
-      <h1>Base64 to File</h1>
-      <p>
-        Paste Base64; download locally or upload to Google Drive through your
-        local server. No Google secrets in this page.
-      </p>
+<head>
+  <meta charset="utf-8" />
+  <title>Decoder Ring</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; background:#fafafa; color:#111; padding:30px; }
+    label { font-weight:600; margin-right:8px; }
+    input, button { font: inherit; padding:8px 10px; margin-right:8px; }
+    input { width:300px; max-width:90vw; }
+    button { cursor:pointer; background:#2563eb; color:#fff; border:0; border-radius:4px; }
+    #status { margin-top:15px; white-space:pre-wrap; font-family:monospace; }
+    .overlay { position:fixed; inset:0; background:rgba(0,0,0,0.5); display:grid; place-items:center; z-index:9999; }
+    .panel { background:#fff; color:#111; padding:16px 20px; border-radius:8px; box-shadow:0 4px 16px rgba(0,0,0,0.3); width:min(420px,90vw); text-align:center; }
+  </style>
+</head>
+<body>
+  <label for="name">Filename:</label>
+  <input id="name" type="text" placeholder="" />
+  <button id="go">Submit</button>
+  <div id="status"></div>
 
-      <label for="b64">Base64 input</label>
-      <textarea
-        id="b64"
-        placeholder="Raw Base64 or data:...;base64,...."
-      ></textarea>
+<script>
+(function(){
+  const nameEl = document.getElementById('name');
+  const goEl = document.getElementById('go');
+  const statusEl = document.getElementById('status');
 
-      <div class="grid" style="margin-top: 10px">
-        <div class="row"><label for="filename">Output filename</label></div>
-        <div class="row"><label for="mime">MIME type (optional)</label></div>
-        <input id="filename" type="text" placeholder="example.bin" />
-        <input
-          id="mime"
-          type="text"
-          placeholder="e.g. application/pdf or image/png"
-        />
-      </div>
+  function setStatus(msg){ statusEl.textContent = msg; }
 
-      <div class="row" style="margin-top: 14px">
-        <button id="btnDownload" class="btn">Convert and Download</button>
-        <button id="btnAuth" class="btn secondary">Authorize Google</button>
-        <button id="btnUpload" class="btn" disabled>
-          Convert and Upload to Drive
-        </button>
-      </div>
+  function openPasteOverlay(){
+    return new Promise((resolve, reject) => {
+      const overlay = document.createElement('div');
+      overlay.className = 'overlay';
+      overlay.innerHTML = `
+        <div class="panel">
+          <div>Press <b>Ctrl+V</b> (or Cmd+V) now.<br>Press <b>Esc</b> to cancel.</div>
+        </div>`;
+      document.body.appendChild(overlay);
 
-      <div id="status" class="status">Ready.</div>
-    </div>
-
-    <script>
-      const statusEl = document.getElementById("status");
-      const b64El = document.getElementById("b64");
-      const nameEl = document.getElementById("filename");
-      const mimeEl = document.getElementById("mime");
-      const btnDownload = document.getElementById("btnDownload");
-      const btnAuth = document.getElementById("btnAuth");
-      const btnUpload = document.getElementById("btnUpload");
-
-      function setStatus(msg, level) {
-        statusEl.textContent = msg;
-        statusEl.classList.remove("ok", "warn", "err");
-        if (level) statusEl.classList.add(level);
+      function onPaste(e){
+        e.preventDefault();
+        const text = e.clipboardData.getData('text');
+        cleanup(); resolve(text || "");
       }
-
-      function parseInput(raw) {
-        const s = raw.trim();
-        const idx = s.indexOf("base64,");
-        if (idx >= 0 && s.startsWith("data:")) {
-          const header = s.slice(5, idx - 1);
-          const mime = header.split(";")[0] || "";
-          const payload = s.slice(idx + 7);
-          return { mime: mime || "", base64: payload };
-        }
-        return { mime: "", base64: s.replace(/\s+/g, "") };
+      function onKey(e){
+        if (e.key === 'Escape'){ cleanup(); reject(new Error('cancelled')); }
       }
-
-      function base64ToBlob(b64, mime = "") {
-        const byteChars = atob(b64);
-        const part = 1024 * 1024;
-        const parts = [];
-        for (let i = 0; i < byteChars.length; i += part) {
-          const slice = byteChars.slice(i, i + part);
-          const bytes = new Uint8Array(slice.length);
-          for (let j = 0; j < slice.length; j++) bytes[j] = slice.charCodeAt(j);
-          parts.push(bytes);
-        }
-        return new Blob(parts, { type: mime || "application/octet-stream" });
+      function cleanup(){
+        overlay.removeEventListener('paste', onPaste);
+        window.removeEventListener('keydown', onKey);
+        document.body.removeChild(overlay);
       }
+      overlay.addEventListener('paste', onPaste);
+      window.addEventListener('keydown', onKey);
+      overlay.tabIndex = -1;
+      overlay.focus({ preventScroll: true });
+    });
+  }
 
-      function downloadBlob(blob, name) {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = name || "file.bin";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-      }
+  function extractBase64(text){
+    const s = text.trim();
+    const i = s.indexOf('base64,');
+    if (i >= 0 && s.startsWith('data:')) return s.slice(i + 7).replace(/\s+/g, '');
+    return s.replace(/\s+/g, '');
+  }
 
-      async function checkAuth() {
-        try {
-          const resp = await fetch("/api/status", { credentials: "include" });
-          const js = await resp.json();
-          if (js.authed) {
-            btnUpload.disabled = false;
-            setStatus("Google authorization present; you can upload.", "ok");
-          } else {
-            btnUpload.disabled = true;
-            setStatus("Not authorized with Google yet.", "warn");
-          }
-        } catch (e) {
-          setStatus("Server not reachable. Start the container.", "err");
-        }
-      }
+  async function chunkedSend(base64Text, onProgress){
+    const startResp = await fetch('/api/chunk/start', { method: 'POST' });
+    const startJs = await startResp.json();
+    if (!startResp.ok || !startJs.ok) throw new Error(startJs.error || 'start failed');
+    const upload_id = startJs.upload_id;
 
-      btnAuth.addEventListener("click", () => {
-        window.open("/oauth/start", "_blank", "width=500,height=650");
-        setStatus(
-          "Complete Google consent in the popup; then return here and click Upload.",
-          "warn"
-        );
-        setTimeout(checkAuth, 2000);
+    const CHUNK = 512 * 1024; // 512 KB per request
+    const total = base64Text.length;
+    let seq = 0;
+    for (let off = 0; off < total; off += CHUNK) {
+      const data = base64Text.slice(off, Math.min(total, off + CHUNK));
+      const resp = await fetch('/api/chunk/append', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ upload_id, seq, data })
       });
+      const js = await resp.json();
+      if (!resp.ok || !js.ok) throw new Error(js.error || 'append failed');
+      seq++;
+      if (onProgress) onProgress(Math.min(1, (off + data.length) / total));
+    }
+    return upload_id;
+  }
 
-      btnDownload.addEventListener("click", () => {
-        try {
-          const { mime: mFrom, base64 } = parseInput(b64El.value);
-          if (!base64) {
-            setStatus("No Base64 to convert.", "warn");
-            return;
-          }
-          const name = (nameEl.value || "file.bin").trim();
-          const mime = (
-            mimeEl.value ||
-            mFrom ||
-            "application/octet-stream"
-          ).trim();
-          const blob = base64ToBlob(base64, mime);
-          downloadBlob(blob, name);
-          setStatus(`Saved ${name} locally.`, "ok");
-        } catch (e) {
-          console.error(e);
-          setStatus("Conversion failed. See console for details.", "err");
+  async function finishDrive(upload_id, name){
+    const mime = 'application/octet-stream';
+    const resp = await fetch('/api/chunk/finish/drive', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ upload_id, name: name || 'file.bin', mime })
+    });
+    const js = await resp.json().catch(() => ({}));
+    if (!resp.ok || !js.ok) throw new Error((js && js.error) || resp.statusText || 'finish failed');
+    return js;
+  }
+
+  // Authorization helper: open popup and poll /api/status until authed
+  async function ensureAuthorized(timeoutMs = 120000, intervalMs = 2000){
+    setStatus('Authorization required');
+    let popup = null;
+    try {
+      popup = window.open('/oauth/start', 'gdrive_auth', 'width=500,height=650');
+    } catch(e) {
+      // popup blocked; navigate current tab
+      location.href = '/oauth/start';
+      return new Promise(()=>{}); // stop further execution in this click flow
+    }
+
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      await new Promise(r => setTimeout(r, intervalMs));
+      try {
+        const s = await fetch('/api/status', { credentials: 'include' });
+        const js = await s.json();
+        if (js && js.authed) {
+          try { if (popup && !popup.closed) popup.close(); } catch {}
+          setStatus('Authorized; continuing…');
+          return true;
         }
-      });
+      } catch {}
+      // continue polling
+    }
+    try { if (popup && !popup.closed) popup.close(); } catch {}
+    throw new Error('authorization_timeout');
+  }
 
-      btnUpload.addEventListener("click", async () => {
-        try {
-          const { mime: mFrom, base64 } = parseInput(b64El.value);
-          if (!base64) {
-            setStatus("No Base64 to convert.", "warn");
-            return;
-          }
-          const name = (nameEl.value || "file.bin").trim();
-          const mime = (
-            mimeEl.value ||
-            mFrom ||
-            "application/octet-stream"
-          ).trim();
+  goEl.addEventListener('click', async () => {
+    try {
+      setStatus('Waiting…');
+      const text = await openPasteOverlay();
+      if (!text) { setStatus('No data detected.'); return; }
 
-          setStatus("Uploading to Google Drive...", null);
-          const resp = await fetch("/api/drive/upload", {
-            method: "POST",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name, mime, base64 }),
-          });
-          const js = await resp.json();
-          if (!resp.ok || !js.ok) throw new Error(js.error || "Upload failed");
+      const base64 = extractBase64(text);
+      if (!base64) { setStatus('Invalid data.'); return; }
 
-          setStatus(`Uploaded to Drive: ${js.name} (id ${js.id})`, "ok");
-        } catch (e) {
-          console.error(e);
-          setStatus("Drive upload failed: " + e.message, "err");
-        }
-      });
+      const dest = (nameEl.value || 'file.bin').trim();
+      setStatus('Starting upload…');
 
-      checkAuth();
-    </script>
-  </body>
+      const upload_id = await chunkedSend(base64, p => setStatus(`Uploading ${(p*100).toFixed(1)}%`));
+
+      setStatus('Decoding…');
+      try {
+        const res = await finishDrive(upload_id, dest);
+        setStatus(`Decoded "${res.name}" (id ${res.id}).`);
+        return;
+      } catch (e) {
+        if (!(String(e.message || e).includes('not_authed'))) throw e;
+      }
+
+      // If we get here, we are not authorized. Trigger auth flow, then retry once.
+      await ensureAuthorized();
+      const res2 = await finishDrive(upload_id, dest);
+      setStatus(`Decoded "${res2.name}" (id ${res2.id}).`);
+    } catch (e) {
+      if (String(e).includes('cancelled')) {
+        setStatus('Cancelled.');
+      } else if (String(e).includes('authorization_timeout')) {
+        setStatus('Authorization timed out. Try again.');
+      } else {
+        setStatus('Error: ' + (e.message || e));
+      }
+    }
+  });
+})();
+</script>
+</body>
 </html>

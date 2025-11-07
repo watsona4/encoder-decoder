@@ -1,46 +1,73 @@
 #!/usr/bin/env python3
 import base64
 import json
+import logging
 import os
+import pathlib
 import secrets
+import shutil
 import time
+import uuid
 from urllib.parse import urlencode
 
 import redis
 import requests
-from flask import Flask, jsonify, redirect, request, send_from_directory
+from flask import Flask, Response, jsonify, redirect, request, send_from_directory
 
+# ── Config ────────────────────────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8000"))
+
+# Redis via individual env vars (no local container)
 REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_USERNAME = os.getenv("REDIS_USERNAME")
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_USERNAME = os.getenv("REDIS_USERNAME") or None
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+REDIS_SSL = os.getenv("REDIS_SSL", "false").lower() in ("1", "true", "yes")
+
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI", f"http://localhost:{PORT}/oauth/callback")
+
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
 
 if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-    raise SystemExit("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in the environment.")
+    raise SystemExit("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET")
 
 if not REDIS_HOST:
-    raise SystemExit("Set REDIS_HOST in the environment.")
+    raise SystemExit("Set REDIS_HOST (and optionally REDIS_PORT/DB/USERNAME/PASSWORD/SSL) to use your existing Redis.")
 
+# Build Redis client
 r = redis.Redis(
     host=REDIS_HOST,
     port=REDIS_PORT,
-    username=REDIS_USERNAME or None,
-    password=REDIS_PASSWORD or None,
     db=REDIS_DB,
+    username=REDIS_USERNAME,
+    password=REDIS_PASSWORD,
+    ssl=REDIS_SSL,
+    decode_responses=False,  # store tokens as bytes
+    socket_timeout=5,
+    socket_connect_timeout=5,
 )
+
+# Test connection early (fail fast)
+try:
+    r.ping()
+except Exception as e:
+    raise SystemExit(f"Failed to connect to Redis at {REDIS_HOST}:{REDIS_PORT} db={REDIS_DB} ssl={REDIS_SSL}: {e}")
+
 app = Flask(__name__, static_folder=".", static_url_path="")
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("b64drive")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# ── Token helpers ─────────────────────────────────────────────────────────────
 def get_session_id():
     sid = request.cookies.get("sid")
     if not sid:
@@ -52,17 +79,16 @@ def redis_key(sid, suffix):
     return f"b64drive:{sid}:{suffix}"
 
 
-def save_tokens(sid, token_resp):
-    now = int(time.time())
-    expiry = now + int(token_resp.get("expires_in", 3600)) - 60
+def save_tokens(sid, tok):
+    exp = int(time.time()) + int(tok.get("expires_in", 3600)) - 60
     data = {
-        "access_token": token_resp["access_token"],
-        "refresh_token": token_resp.get("refresh_token"),
-        "expires_at": expiry,
-        "scope": token_resp.get("scope", DRIVE_SCOPE),
-        "token_type": token_resp.get("token_type", "Bearer"),
+        "access_token": tok["access_token"],
+        "refresh_token": tok.get("refresh_token"),
+        "expires_at": exp,
+        "scope": tok.get("scope", DRIVE_SCOPE),
+        "token_type": tok.get("token_type", "Bearer"),
     }
-    r.setex(redis_key(sid, "tokens"), 60 * 60 * 24 * 30, json.dumps(data))
+    r.setex(redis_key(sid, "tokens"), 60 * 60 * 24 * 30, json.dumps(data).encode())
 
 
 def load_tokens(sid):
@@ -70,56 +96,55 @@ def load_tokens(sid):
     return json.loads(raw) if raw else None
 
 
-def refresh_access_token(sid, tokens):
-    if not tokens or not tokens.get("refresh_token"):
+def refresh_access_token(sid, tok):
+    if not tok or not tok.get("refresh_token"):
         return None
-    payload = {
+    p = {
         "client_id": GOOGLE_CLIENT_ID,
         "client_secret": GOOGLE_CLIENT_SECRET,
         "grant_type": "refresh_token",
-        "refresh_token": tokens["refresh_token"],
+        "refresh_token": tok["refresh_token"],
     }
-    resp = requests.post(GOOGLE_OAUTH_TOKEN_URL, data=payload, timeout=20)
+    resp = requests.post(GOOGLE_OAUTH_TOKEN_URL, data=p, timeout=20)
     if resp.status_code != 200:
         return None
     tr = resp.json()
     if "refresh_token" not in tr:
-        tr["refresh_token"] = tokens.get("refresh_token")
+        tr["refresh_token"] = tok["refresh_token"]
     save_tokens(sid, tr)
     return load_tokens(sid)
 
 
 def get_valid_access_token(sid):
-    tokens = load_tokens(sid)
-    if not tokens:
+    tok = load_tokens(sid)
+    if not tok:
         return None
-    if int(time.time()) >= int(tokens.get("expires_at", 0)):
-        tokens = refresh_access_token(sid, tokens)
-        if not tokens:
+    if int(time.time()) >= tok.get("expires_at", 0):
+        tok = refresh_access_token(sid, tok)
+        if not tok:
             return None
-    return tokens["access_token"]
+    return tok["access_token"]
 
 
 def make_sid_response(payload):
     sid = get_session_id()
     resp = jsonify(payload)
-    resp.set_cookie("sid", sid, max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax")
+    resp.set_cookie("sid", sid, max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax", path="/")
     return resp, sid
 
 
-# ── UI route ──────────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def index():
-    # Serve local index.html from the container
     return send_from_directory(".", "index.html")
 
 
-# ── API routes ────────────────────────────────────────────────────────────────
+# ── Auth & status ─────────────────────────────────────────────────────────────
 @app.get("/api/status")
 def api_status():
     sid = get_session_id()
-    tokens = load_tokens(sid)
-    authed = bool(tokens and int(time.time()) < tokens.get("expires_at", 0))
+    tok = load_tokens(sid)
+    authed = bool(tok and int(time.time()) < tok.get("expires_at", 0))
     resp, sid = make_sid_response({"ok": True, "authed": authed})
     return resp
 
@@ -128,8 +153,8 @@ def api_status():
 def oauth_start():
     sid = get_session_id()
     state = secrets.token_urlsafe(24)
-    r.setex(redis_key(sid, "state"), 600, state)
-    params = {
+    r.setex(redis_key(sid, "state"), 600, state.encode())
+    q = {
         "client_id": GOOGLE_CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
         "response_type": "code",
@@ -139,9 +164,9 @@ def oauth_start():
         "prompt": "consent",
         "state": state,
     }
-    url = f"{GOOGLE_OAUTH_AUTH_URL}?{urlencode(params)}"
-    resp = redirect(url, code=302)
-    resp.set_cookie("sid", sid, max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax")
+    url = f"{GOOGLE_OAUTH_AUTH_URL}?{urlencode(q)}"
+    resp = redirect(url, 302)
+    resp.set_cookie("sid", sid, max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax", path="/")
     return resp
 
 
@@ -149,79 +174,250 @@ def oauth_start():
 def oauth_callback():
     sid = get_session_id()
     code = request.args.get("code")
-    state = request.args.get("state")
-    expected_state = r.get(redis_key(sid, "state"))
-    if not code or not expected_state or expected_state.decode() != state:
-        return "Invalid OAuth state.", 400
-    data = {
+    st = request.args.get("state")
+    exp = r.get(redis_key(sid, "state"))
+    if not code or not exp or exp.decode() != st:
+        return "Invalid state", 400
+    d = {
         "code": code,
         "client_id": GOOGLE_CLIENT_ID,
         "client_secret": GOOGLE_CLIENT_SECRET,
         "redirect_uri": REDIRECT_URI,
         "grant_type": "authorization_code",
     }
-    resp = requests.post(GOOGLE_OAUTH_TOKEN_URL, data=data, timeout=20)
+    resp = requests.post(GOOGLE_OAUTH_TOKEN_URL, data=d, timeout=20)
     if resp.status_code != 200:
         return f"Token exchange failed: {resp.text}", 400
     save_tokens(sid, resp.json())
-    return """<html><body><p>Authorized. You can close this tab.</p><script>setTimeout(()=>window.close(),700);</script></body></html>"""
+    return "<p>Authorized. You can close this tab.</p><script>setTimeout(()=>window.close(),700)</script>"
 
 
-@app.post("/api/drive/upload")
-def drive_upload():
+# ── Chunked upload endpoints ──────────────────────────────────────────────────
+TMP_ROOT = pathlib.Path(os.getenv("B64_TMP_DIR", "/tmp/b64drive"))
+TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _sid():
+    return request.cookies.get("sid") or ""
+
+
+def _udir(sid, uid):
+    d = TMP_ROOT / sid / uid
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _b64p(sid, uid):
+    return _udir(sid, uid) / "payload.b64"
+
+
+def _meta(sid, uid):
+    return _udir(sid, uid) / "meta.json"
+
+
+@app.post("/api/chunk/start")
+def chunk_start():
     sid = get_session_id()
-    token = get_valid_access_token(sid)
-    if not token:
-        return jsonify({"ok": False, "error": "not_authed"}), 401
-
+    uid = uuid.uuid4().hex
+    dirp = _udir(sid, uid)
     try:
-        payload = request.get_json(force=True)
-        name = payload.get("name", "file.bin")
-        mime = payload.get("mime", "application/octet-stream")
-        b64 = payload.get("base64", "")
-        if "," in b64 and b64.strip().startswith("data:"):
-            b64 = b64.split("base64,", 1)[-1]
-        b64 = "".join(b64.split())
-        raw = base64.b64decode(b64, validate=False)
+        _meta(sid, uid).write_bytes(json.dumps({"seq": -1}).encode())
+        _b64p(sid, uid).write_bytes(b"")
     except Exception as e:
-        return jsonify({"ok": False, "error": f"bad_input: {e}"}), 400
+        logger.exception("chunk_start failed: sid=%s uid=%s dir=%s", sid, uid, dirp)
+        return jsonify({"ok": False, "error": f"init_failed: {e}"}), 500
+    logger.info("chunk_start ok: sid=%s uid=%s dir=%s", sid, uid, dirp)
+    resp, _ = make_sid_response({"ok": True, "upload_id": uid})
+    resp.set_cookie("sid", sid, max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax", path="/")
+    return resp
 
-    boundary = "bnd" + secrets.token_hex(8)
+
+@app.post("/api/chunk/append")
+def chunk_append():
+    sid = _sid()
+    b = request.get_json(force=True)
+    uid = b.get("upload_id")
+    seq = int(b.get("seq", -1))
+    data = b.get("data", "")
+    logger.debug(
+        "chunk_append in: sid=%s uid=%s seq=%s data_len=%s", sid, uid, seq, len(data) if isinstance(data, str) else -1
+    )
+    if not uid or seq < 0 or not data:
+        logger.warning("chunk_append bad_args: sid=%s uid=%s seq=%s", sid, uid, seq)
+        return jsonify({"ok": False, "error": "bad_args"}), 400
+    m = _meta(sid, uid)
+    if not m.exists():
+        logger.warning("chunk_append unknown_upload: sid=%s uid=%s meta=%s", sid, uid, m)
+        return jsonify({"ok": False, "error": "unknown_upload"}), 404
+    meta = json.loads(m.read_bytes() or b"{}")
+    exp = meta.get("seq", -1) + 1
+    if seq != exp:
+        logger.warning("chunk_append out_of_order: sid=%s uid=%s expected=%s got=%s", sid, uid, exp, seq)
+        return jsonify({"ok": False, "error": f"out_of_order expected {exp} got {seq}"}), 409
+    b64p = _b64p(sid, uid)
+    try:
+        with open(b64p, "ab") as f:
+            f.write(data.encode())
+            f.write(b"\n")
+        meta["seq"] = seq
+        m.write_bytes(json.dumps(meta).encode())
+    except Exception as e:
+        logger.exception("chunk_append write_failed: sid=%s uid=%s path=%s", sid, uid, b64p)
+        return jsonify({"ok": False, "error": f"write_failed: {e}"}), 500
+    logger.debug(
+        "chunk_append ok: sid=%s uid=%s seq=%s path=%s size_now=%s",
+        sid,
+        uid,
+        seq,
+        b64p,
+        b64p.stat().st_size if b64p.exists() else -1,
+    )
+    return jsonify({"ok": True, "next": seq + 1})
+
+
+def _iter_b64_file_decode(p: pathlib.Path):
+    carry = ""
+    with open(p, "rt", encoding="utf-8", errors="ignore") as f:
+        for slab in f:
+            s = carry + slab.strip().replace(" ", "")
+            use = (len(s) // 4) * 4
+            if use:
+                yield base64.b64decode(s[:use])
+                carry = s[use:]
+            else:
+                carry = s
+    if carry:
+        pad = carry + "==="[: (4 - len(carry) % 4) % 4]
+        yield base64.b64decode(pad)
+
+
+@app.post("/api/chunk/finish/download")
+def chunk_finish_download():
+    sid = _sid()
+    b = request.get_json(force=True)
+    uid = b.get("upload_id")
+    name = b.get("name", "file.bin")
+    mime = b.get("mime", "application/octet-stream")
+    p = _b64p(sid, uid) if uid else None
+    logger.info(
+        "finish_download in: sid=%s uid=%s name=%s mime=%s path=%s exists=%s",
+        sid,
+        uid,
+        name,
+        mime,
+        p,
+        p.exists() if p else False,
+    )
+    if not uid:
+        return jsonify({"ok": False, "error": "bad_args"}), 400
+    if not p.exists():
+        logger.warning("finish_download unknown_upload: sid=%s uid=%s path=%s", sid, uid, p)
+        return jsonify({"ok": False, "error": "unknown_upload"}), 404
+    h = {"Content-Type": mime, "Content-Disposition": f'attachment; filename="{name}"'}
+
+    def g():
+        try:
+            for c in _iter_b64_file_decode(p):
+                yield c
+            logger.info("finish_download decode_complete: sid=%s uid=%s", sid, uid)
+        finally:
+            try:
+                shutil.rmtree(_udir(sid, uid), ignore_errors=True)
+                logger.info("finish_download cleanup_ok: sid=%s uid=%s dir=%s", sid, uid, _udir(sid, uid))
+            except Exception:
+                logger.exception("finish_download cleanup_failed: sid=%s uid=%s", sid, uid)
+
+    return Response(g(), headers=h)
+
+
+@app.post("/api/chunk/finish/drive")
+def chunk_finish_drive():
+    sid = _sid()
+    tok = get_valid_access_token(sid)
+    if not tok:
+        return jsonify({"ok": False, "error": "not_authed"}), 401
+    b = request.get_json(force=True)
+    uid = b.get("upload_id")
+    name = b.get("name", "file.bin")
+    mime = b.get("mime", "application/octet-stream")
+    p = _b64p(sid, uid) if uid else None
+    logger.info(
+        "finish_drive in: sid=%s uid=%s name=%s mime=%s path=%s exists=%s",
+        sid,
+        uid,
+        name,
+        mime,
+        p,
+        p.exists() if p else False,
+    )
+    if not uid:
+        return jsonify({"ok": False, "error": "bad_args"}), 400
+    if not p.exists():
+        logger.warning("finish_drive unknown_upload: sid=%s uid=%s path=%s", sid, uid, p)
+        return jsonify({"ok": False, "error": "unknown_upload"}), 404
+    out = _udir(sid, uid) / "payload.bin"
+    try:
+        with open(out, "wb") as o:
+            for c in _iter_b64_file_decode(p):
+                o.write(c)
+        logger.info("finish_drive decode_done: sid=%s uid=%s out=%s size=%s", sid, uid, out, out.stat().st_size)
+    except Exception:
+        logger.exception("finish_drive decode_failed: sid=%s uid=%s", sid, uid)
+        return jsonify({"ok": False, "error": "decode_failed"}), 500
     meta = {"name": name}
-    parts = []
+    boundary = "bnd" + uuid.uuid4().hex
 
-    def enc(s):
-        return s.encode("utf-8")
+    def multipart():
+        yield f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode()
+        yield json.dumps(meta).encode()
+        yield f"\r\n--{boundary}\r\nContent-Type: {mime}\r\n\r\n".encode()
+        with open(out, "rb") as f:
+            while True:
+                buf = f.read(1024 * 1024)
+                if not buf:
+                    break
+                yield buf
+        yield f"\r\n--{boundary}--\r\n".encode()
 
-    parts.append(enc(f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"))
-    parts.append(enc(json.dumps(meta)))
-    parts.append(enc(f"\r\n--{boundary}\r\nContent-Type: {mime}\r\n\r\n"))
-    parts.append(raw)
-    parts.append(enc(f"\r\n--{boundary}--\r\n"))
-    body = b"".join(parts)
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": f"multipart/related; boundary={boundary}",
-    }
-    resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, data=body, timeout=120)
-
+    h = {"Authorization": f"Bearer {tok}", "Content-Type": f"multipart/related; boundary={boundary}"}
+    resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=h, data=multipart(), timeout=600)
     if resp.status_code not in (200, 201):
-        # quick refresh; one retry
-        tokens = refresh_access_token(sid, load_tokens(sid) or {})
-        if tokens:
-            headers["Authorization"] = f"Bearer {tokens['access_token']}"
-            resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, data=body, timeout=120)
-
+        new = refresh_access_token(sid, load_tokens(sid) or {})
+        if new:
+            h["Authorization"] = f"Bearer {new['access_token']}"
+            resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=h, data=multipart(), timeout=600)
+    try:
+        info = resp.json()
+    except:
+        info = {}
+    try:
+        shutil.rmtree(_udir(sid, uid), ignore_errors=True)
+        logger.info("finish_drive cleanup_ok: sid=%s uid=%s", sid, uid)
+    except Exception:
+        logger.exception("finish_drive cleanup_failed: sid=%s uid=%s", sid, uid)
     if resp.status_code not in (200, 201):
         return jsonify({"ok": False, "error": f"drive_error {resp.status_code}: {resp.text[:500]}"}), 502
-
-    info = resp.json()
     return jsonify({"ok": True, "id": info.get("id"), "name": info.get("name")})
 
 
-def app_factory():
-    return app
+# ── Debug endpoint ────────────────────────────────────────────────────────────
+@app.get("/api/chunk/debug")
+def chunk_debug():
+    sid = _sid()
+    base = TMP_ROOT / sid
+    info = []
+    if base.exists():
+        for uid_dir in base.iterdir():
+            if uid_dir.is_dir():
+                b64 = _b64p(sid, uid_dir.name)
+                info.append({
+                    "uid": uid_dir.name,
+                    "meta_exists": (_meta(sid, uid_dir.name)).exists(),
+                    "b64_exists": b64.exists(),
+                    "b64_size": b64.stat().st_size if b64.exists() else 0,
+                })
+    logger.info("chunk_debug: sid=%s entries=%s", sid, len(info))
+    return jsonify({"sid": sid, "root": str(base), "uploads": info})
 
 
 if __name__ == "__main__":
