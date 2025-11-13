@@ -10,7 +10,8 @@ import shutil
 import subprocess
 import time
 import uuid
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
+import re
 
 import redis
 import requests
@@ -126,6 +127,51 @@ def get_valid_access_token(sid):
         if not tok:
             return None
     return tok["access_token"]
+
+
+AUTOLINK_RE = re.compile(r"<([^>\s]+)>")
+
+
+def _has_local_reference(markdown_text):
+    def is_forbidden_target(target):
+        target = target.strip()
+        if not target:
+            return False
+        if target.startswith("#"):
+            return False
+        parsed = urlparse(target)
+        if parsed.scheme:
+            if parsed.scheme.lower() in ("http", "https", "mailto", "data"):
+                return False
+            return True
+        if target.startswith(("/", "./", "../", "~/", "\\")):
+            return True
+        if re.match(r"^[a-zA-Z]:\\", target):
+            return True
+        if os.path.isabs(target):
+            return True
+        return True
+
+    for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", markdown_text):
+        if is_forbidden_target(match.group(1)):
+            return True
+    for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", markdown_text):
+        if is_forbidden_target(match.group(1)):
+            return True
+    for match in AUTOLINK_RE.finditer(markdown_text):
+        if is_forbidden_target(match.group(1)):
+            return True
+    include_patterns = (
+        re.compile(r"^\s*!include\s+", re.IGNORECASE),
+        re.compile(r"^\s*include::", re.IGNORECASE),
+        re.compile(r"^\s*%\s*include\b", re.IGNORECASE),
+        re.compile(r"^\s*\\(include|input)\b"),
+    )
+    for line in markdown_text.splitlines():
+        for pat in include_patterns:
+            if pat.search(line):
+                return True
+    return False
 
 
 def make_sid_response(payload):
@@ -426,6 +472,17 @@ def markdown_convert():
     filename = (body.get("filename") or "").strip() if isinstance(body, dict) else ""
     if not isinstance(markdown_text, str) or not markdown_text.strip():
         return jsonify({"ok": False, "error": "missing_markdown"}), 400
+    if _has_local_reference(markdown_text):
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "local_references_forbidden",
+                    "message": "Markdown references local files or include directives, which is not allowed.",
+                }
+            ),
+            400,
+        )
     filename = os.path.basename(filename)
     if not filename:
         filename = "document.docx"
