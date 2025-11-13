@@ -168,6 +168,10 @@
           Submit Markdown
         </button>
       </div>
+      <p class="hint" id="server-hint" hidden>
+        Copy a base64 envelope and press Submit, or copy Markdown and press
+        Submit Markdown. Provide a filename to choose the output type.
+      </p>
       <progress id="progress" value="0" max="1" hidden></progress>
       <pre id="status">Pick a file to begin.</pre>
     </main>
@@ -181,6 +185,7 @@
         const submitBase64Btn = document.getElementById("submit-base64-btn");
         const submitMarkdownBtn = document.getElementById("submit-markdown-btn");
         const filenameInput = document.getElementById("filename");
+        const serverHint = document.getElementById("server-hint");
         const progressEl = document.getElementById("progress");
 
         const TRANSFER_FIELD = ["u", "p", "l", "o", "a", "d", "_", "i", "d"].join("");
@@ -198,7 +203,7 @@
 
         fileInput.addEventListener("change", async (e) => {
           const file = e.target.files?.[0];
-          if (!file || state.busy) return;
+          if (!file || state.busy || state.mode !== "client") return;
           await handleClientSelection(file);
         });
 
@@ -572,9 +577,7 @@
           if (state.mode !== next) {
             state.mode = next;
             if (next === "server") {
-              setStatus(
-                "Ready. Copy a base64 envelope and press Submit, copy Markdown and press Submit Markdown, or pick a file to decode locally."
-              );
+              setStatus("Ready. Press Submit.");
             } else {
               setStatus("Pick a file and it will decode immediately.");
             }
@@ -584,16 +587,17 @@
 
         function refreshUI() {
           const serverMode = state.mode === "server";
-          clientPicker.hidden = false;
+          clientPicker.hidden = serverMode;
           submitBase64Btn.hidden = !serverMode;
           submitMarkdownBtn.hidden = !serverMode;
           filenameInput.hidden = !serverMode;
+          serverHint.hidden = !serverMode;
           submitBase64Btn.disabled =
             !serverMode || state.busy || !state.serverAvailable;
           submitMarkdownBtn.disabled =
             !serverMode || state.busy || !state.serverAvailable;
           filenameInput.disabled = !serverMode || state.busy;
-          fileInput.disabled = state.busy;
+          fileInput.disabled = state.busy || serverMode;
         }
 
         function formatBytes(bytes) {
