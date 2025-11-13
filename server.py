@@ -136,7 +136,7 @@ def make_sid_response(payload):
 # ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def index():
-    return send_from_directory(".", "decoder.html")
+    return send_from_directory(".", "index.html")
 
 
 # ── Auth & status ─────────────────────────────────────────────────────────────

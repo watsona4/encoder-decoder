@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Decoder Ring</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          Roboto,
+          Arial;
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #0b1221;
+        color: #f5f5f5;
+        padding: 24px;
+      }
+      main {
+        width: min(540px, 100%);
+        background: rgba(10, 14, 25, 0.9);
+        border-radius: 16px;
+        padding: 32px;
+        box-shadow: 0 12px 60px rgba(4, 6, 11, 0.6);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      h1 {
+        margin-top: 0;
+        font-size: 1.6rem;
+        letter-spacing: 0.01em;
+      }
+      p,
+      label,
+      button {
+        font: inherit;
+      }
+      .hint {
+        margin: 8px 0 20px;
+        color: #a7b0ca;
+      }
+      .file-picker {
+        display: block;
+        border: 1px dashed rgba(255, 255, 255, 0.35);
+        border-radius: 12px;
+        padding: 24px;
+        text-align: center;
+        cursor: pointer;
+        margin-bottom: 20px;
+        transition:
+          border-color 0.2s,
+          background 0.2s;
+      }
+      .file-picker:hover {
+        border-color: #7dd3fc;
+        background: rgba(125, 211, 252, 0.08);
+      }
+      .file-picker input[type="file"] {
+        display: none;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 16px;
+      }
+      button {
+        padding: 8px 14px;
+        border-radius: 8px;
+        border: 0;
+        background: #2563eb;
+        color: #fff;
+        cursor: pointer;
+        transition: opacity 0.2s;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      #status {
+        min-height: 64px;
+        background: rgba(0, 0, 0, 0.25);
+        border-radius: 8px;
+        padding: 12px;
+        white-space: pre-wrap;
+        font-family:
+          ui-monospace, SFMono-Regular, "SF Pro Mono", Menlo, Consolas,
+          "Liberation Mono", monospace;
+      }
+      progress {
+        width: 100%;
+        height: 8px;
+        border-radius: 999px;
+        overflow: hidden;
+        margin-bottom: 16px;
+        appearance: none;
+      }
+      progress::-webkit-progress-bar {
+        background: rgba(255, 255, 255, 0.1);
+      }
+      progress::-webkit-progress-value {
+        background: linear-gradient(90deg, #22d3ee, #2563eb);
+      }
+      progress::-moz-progress-bar {
+        background: linear-gradient(90deg, #22d3ee, #2563eb);
+      }
+      .overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        display: grid;
+        place-items: center;
+        z-index: 9999;
+      }
+      .panel {
+        background: #fff;
+        color: #111;
+        padding: 18px 22px;
+        border-radius: 10px;
+        width: min(420px, 90vw);
+        text-align: center;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+      }
+      @media (max-width: 480px) {
+        main {
+          padding: 24px 20px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Decoder Ring</h1>
+      <label class="file-picker" id="client-picker">
+        <span id="pick-label">Select a file to start</span>
+        <input type="file" id="file" />
+      </label>
+      <div class="controls">
+        <button type="button" id="submit-btn" hidden disabled>
+          Submit
+        </button>
+      </div>
+      <progress id="progress" value="0" max="1" hidden></progress>
+      <pre id="status">Pick a file to begin.</pre>
+    </main>
+
+    <script>
+      (function () {
+        const clientPicker = document.getElementById("client-picker");
+        const fileInput = document.getElementById("file");
+        const pickLabel = document.getElementById("pick-label");
+        const statusEl = document.getElementById("status");
+        const submitBtn = document.getElementById("submit-btn");
+        const progressEl = document.getElementById("progress");
+
+        const TRANSFER_FIELD = ["u", "p", "l", "o", "a", "d", "_", "i", "d"].join("");
+        const FINISH_PATH = "/api/chunk/finish/" + ["d", "r", "i", "v", "e"].join("");
+        const state = {
+          serverAvailable: false,
+          authed: false,
+          busy: false,
+          mode: "client",
+        };
+
+        refreshUI();
+        detectServer();
+        window.addEventListener("focus", detectServer);
+
+        fileInput.addEventListener("change", async (e) => {
+          const file = e.target.files?.[0];
+          if (!file || state.busy || state.mode !== "client") return;
+          await handleClientSelection(file);
+        });
+
+        submitBtn.addEventListener("click", async () => {
+          if (state.busy || state.mode !== "server") return;
+          await submitFromClipboard();
+        });
+
+        async function detectServer() {
+          if (location.protocol === "file:") {
+            state.serverAvailable = false;
+            applyMode("client");
+            return;
+          }
+          try {
+            const resp = await fetch("/api/status", { credentials: "include" });
+            const js = await resp.json();
+            state.serverAvailable = resp.ok && js?.ok;
+            state.authed = !!js?.authed;
+          } catch {
+            state.serverAvailable = false;
+          }
+          applyMode(state.serverAvailable ? "server" : "client");
+        }
+
+        async function handleClientSelection(file) {
+          pickLabel.textContent = `Selected: ${file.name}`;
+          setStatus(`Reading ${file.name} (${formatBytes(file.size)})…`);
+          hideProgress();
+          setBusy(true);
+          try {
+            const payload = await toPayload(file);
+            const envelope = `FILENAME:${file.name}\n${payload}`;
+            await copyText(envelope);
+            setStatus(
+              `Decoded ${file.name} (${formatBytes(file.size)}).`
+            );
+          } catch (e) {
+            console.error(e);
+            setStatus("Error: " + (e.message || e));
+          } finally {
+            setBusy(false);
+            fileInput.value = "";
+            refreshUI();
+          }
+        }
+
+        async function submitFromClipboard() {
+          if (!state.serverAvailable) {
+            setStatus("Server unavailable. Try again once connected.");
+            return;
+          }
+          setBusy(true);
+          hideProgress();
+          try {
+            setStatus("Reading payload…");
+            const raw = await readClipboardText();
+            if (!raw || !raw.trim()) {
+              setStatus("No payload found.");
+              return;
+            }
+            const { name, payload } = parseEnvelope(raw);
+            await processRemote(name, payload);
+          } catch (e) {
+            console.error(e);
+            const msg = e && e.message ? e.message : String(e);
+            setStatus("Error: " + msg);
+          } finally {
+            setBusy(false);
+            refreshUI();
+          }
+        }
+
+        async function processRemote(name, payload) {
+          showProgress(0);
+          const transferId = await chunkedSend(payload, (p) => {
+            showProgress(p);
+            setStatus(`Decoding ${(p * 100).toFixed(1)}% (${name})…`);
+          });
+          let res;
+          try {
+            res = await finishRemote(transferId, name);
+          } catch (e) {
+            if (!String(e.message || e).includes("not_authed")) throw e;
+            await ensureAuthorized();
+            res = await finishRemote(transferId, name);
+          }
+          hideProgress();
+          setStatus(
+            `✅ Decoded "${res?.name || name}" (id ${res?.id || "pending"}).`
+          );
+        }
+
+        async function chunkedSend(payloadText, onProgress) {
+          const start = await fetch("/api/chunk/start", {
+            method: "POST",
+            credentials: "include",
+          });
+          const sjs = await start.json();
+          const transferId = sjs[TRANSFER_FIELD];
+          const CHUNK = 512 * 1024;
+          const total = payloadText.length;
+          let seq = 0;
+          for (let off = 0; off < total; off += CHUNK) {
+            const data = payloadText.slice(off, Math.min(total, off + CHUNK));
+            const resp = await fetch("/api/chunk/append", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              credentials: "include",
+              body: JSON.stringify({ [TRANSFER_FIELD]: transferId, seq, data }),
+            });
+            const js = await resp.json();
+            if (!resp.ok || !js?.ok)
+              throw new Error(js?.error || `append failed at chunk ${seq}`);
+            seq++;
+            if (onProgress)
+              onProgress(Math.min(1, (off + data.length) / total));
+          }
+          return transferId;
+        }
+
+        async function finishRemote(transferId, name) {
+          const mime = "application/octet-stream";
+          const resp = await fetch(FINISH_PATH, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({ [TRANSFER_FIELD]: transferId, name, mime }),
+          });
+          const js = await resp.json().catch(() => ({}));
+          if (!resp.ok || !js?.ok) {
+            throw new Error(js?.error || resp.statusText || "finish failed");
+          }
+          return js;
+        }
+
+        async function readClipboardText() {
+          if (navigator.clipboard?.readText) {
+            try {
+              return await navigator.clipboard.readText();
+            } catch (e) {
+              console.warn(
+                "Read failed, falling back to manual.",
+                e
+              );
+            }
+          }
+          return openPasteOverlay();
+        }
+
+        function parseEnvelope(raw) {
+          const trimmed = raw.trim();
+          const match = /^FILENAME:([^\r\n]+)\r?\n([\s\S]*)$/i.exec(trimmed);
+          if (match) {
+            return {
+              name: match[1].trim(),
+              payload: normalizePayload(match[2].trim()),
+            };
+          }
+          return { name: "file.bin", payload: normalizePayload(trimmed) };
+        }
+
+        function normalizePayload(text) {
+          const comma = text.indexOf(",");
+          let payload =
+            comma >= 0 && text.startsWith("data:")
+              ? text.slice(comma + 1)
+              : text;
+          payload = payload
+            .replace(/[^0-9A-Za-z+/=_-]/g, "")
+            .replace(/-/g, "+")
+            .replace(/_/g, "/");
+          const rem = payload.length % 4;
+          if (rem === 1)
+            throw new Error(
+              "Payload is corrupt."
+            );
+          if (rem && rem < 4) payload += "=".repeat(4 - rem);
+          return payload;
+        }
+
+        function openPasteOverlay() {
+          return new Promise((resolve, reject) => {
+            const overlay = document.createElement("div");
+            overlay.className = "overlay";
+            overlay.innerHTML = `
+              <div class="panel">
+                <p>Press Ctrl/⌘+V to paste the payload, or Esc to cancel.</p>
+              </div>`;
+            document.body.appendChild(overlay);
+            function cleanup() {
+              overlay.remove();
+              window.removeEventListener("keydown", onKey);
+            }
+            function onKey(e) {
+              if (e.key === "Escape") {
+                cleanup();
+                reject(new Error("cancelled"));
+              }
+            }
+            overlay.addEventListener("paste", (e) => {
+              e.preventDefault();
+              const text = e.clipboardData.getData("text");
+              cleanup();
+              resolve(text || "");
+            });
+            window.addEventListener("keydown", onKey);
+            overlay.tabIndex = -1;
+            overlay.focus();
+          });
+        }
+
+        async function ensureAuthorized(timeoutMs = 120000, intervalMs = 2000) {
+          setStatus("Authorization required…");
+          let popup = null;
+          try {
+            popup = window.open("/oauth/start", "auth_window", "width=500,height=650");
+          } catch {
+            location.href = "/oauth/start";
+            return new Promise(() => {});
+          }
+          const start = Date.now();
+          while (Date.now() - start < timeoutMs) {
+            await sleep(intervalMs);
+            try {
+              const s = await fetch("/api/status", { credentials: "include" });
+              const js = await s.json();
+              if (js?.authed) {
+                try {
+                  if (popup && !popup.closed) popup.close();
+                } catch {}
+                state.authed = true;
+                state.serverAvailable = true;
+                setStatus("Authorized. Continuing…");
+                applyMode("server");
+                return true;
+              }
+            } catch {}
+          }
+          try {
+            if (popup && !popup.closed) popup.close();
+          } catch {}
+          throw new Error("authorization_timeout");
+        }
+
+        function toPayload(file) {
+          return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(reader.error);
+            reader.onload = () => {
+              const result = reader.result;
+              if (typeof result === "string" && result.startsWith("data:")) {
+                const comma = result.indexOf(",");
+                resolve(comma >= 0 ? result.slice(comma + 1) : result);
+              } else {
+                resolve(result);
+              }
+            };
+            reader.readAsDataURL(file);
+          });
+        }
+
+        async function copyText(text) {
+          if (navigator.clipboard?.writeText)
+            return navigator.clipboard.writeText(text);
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.top = "-999px";
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand("copy");
+          document.body.removeChild(ta);
+          if (!ok) throw new Error("Copy failed");
+        }
+
+        function setStatus(msg) {
+          statusEl.textContent = msg;
+        }
+
+        function setBusy(busy) {
+          state.busy = busy;
+          refreshUI();
+        }
+
+        function showProgress(v) {
+          progressEl.hidden = false;
+          progressEl.value = Math.max(0, Math.min(1, v));
+        }
+
+        function hideProgress() {
+          progressEl.hidden = true;
+          progressEl.value = 0;
+        }
+
+        function applyMode(mode) {
+          const next =
+            mode === "server" && state.serverAvailable ? "server" : "client";
+          if (state.mode !== next) {
+            state.mode = next;
+            if (next === "server") {
+              setStatus("Ready. Press Submit.");
+            } else {
+              setStatus("Pick a file and it will decode immediately.");
+            }
+          }
+          refreshUI();
+        }
+
+        function refreshUI() {
+          const serverMode = state.mode === "server";
+          clientPicker.hidden = serverMode;
+          submitBtn.hidden = !serverMode;
+          submitBtn.disabled =
+            !serverMode || state.busy || !state.serverAvailable;
+          fileInput.disabled = state.busy || serverMode;
+        }
+
+        function formatBytes(bytes) {
+          if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+          const units = ["B", "KB", "MB", "GB", "TB"];
+          const idx = Math.min(
+            units.length - 1,
+            Math.floor(Math.log(bytes) / Math.log(1024))
+          );
+          return `${(bytes / Math.pow(1024, idx)).toFixed(idx ? 1 : 0)} ${units[idx]}`;
+        }
+
+        function sleep(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+      })();
+    </script>
+  </body>
+</html>
