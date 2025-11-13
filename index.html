@@ -328,7 +328,9 @@
             return sendMarkdown(filename, markdown, true);
           }
           if (!resp.ok || !js?.ok) {
-            throw new Error(js?.error || resp.statusText || "submit_failed");
+            const errMsg =
+              js?.message || js?.error || resp.statusText || "submit_failed";
+            throw new Error(errMsg);
           }
           return js;
         }
