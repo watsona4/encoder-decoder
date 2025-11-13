@@ -2,10 +2,12 @@
 import base64
 import json
 import logging
+import mimetypes
 import os
 import pathlib
 import secrets
 import shutil
+import subprocess
 import time
 import uuid
 from urllib.parse import urlencode
@@ -364,6 +366,18 @@ def chunk_finish_drive():
     except Exception:
         logger.exception("finish_drive decode_failed: sid=%s uid=%s", sid, uid)
         return jsonify({"ok": False, "error": "decode_failed"}), 500
+    ok, payload = _drive_upload(sid, tok, out, name, mime)
+    try:
+        shutil.rmtree(_udir(sid, uid), ignore_errors=True)
+        logger.info("finish_drive cleanup_ok: sid=%s uid=%s", sid, uid)
+    except Exception:
+        logger.exception("finish_drive cleanup_failed: sid=%s uid=%s", sid, uid)
+    if not ok:
+        return jsonify(payload), 502
+    return jsonify({"ok": True, "id": payload.get("id"), "name": payload.get("name")})
+
+
+def _drive_upload(sid, tok, file_path, name, mime):
     meta = {"name": name}
     boundary = "bnd" + uuid.uuid4().hex
 
@@ -371,7 +385,7 @@ def chunk_finish_drive():
         yield f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode()
         yield json.dumps(meta).encode()
         yield f"\r\n--{boundary}\r\nContent-Type: {mime}\r\n\r\n".encode()
-        with open(out, "rb") as f:
+        with open(file_path, "rb") as f:
             while True:
                 buf = f.read(1024 * 1024)
                 if not buf:
@@ -379,25 +393,76 @@ def chunk_finish_drive():
                 yield buf
         yield f"\r\n--{boundary}--\r\n".encode()
 
-    h = {"Authorization": f"Bearer {tok}", "Content-Type": f"multipart/related; boundary={boundary}"}
-    resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=h, data=multipart(), timeout=600)
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        "Content-Type": f"multipart/related; boundary={boundary}",
+    }
+    resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, data=multipart(), timeout=600)
     if resp.status_code not in (200, 201):
         new = refresh_access_token(sid, load_tokens(sid) or {})
         if new:
-            h["Authorization"] = f"Bearer {new['access_token']}"
-            resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=h, data=multipart(), timeout=600)
+            headers["Authorization"] = f"Bearer {new['access_token']}"
+            resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, data=multipart(), timeout=600)
     try:
         info = resp.json()
-    except:
-        info = {}
-    try:
-        shutil.rmtree(_udir(sid, uid), ignore_errors=True)
-        logger.info("finish_drive cleanup_ok: sid=%s uid=%s", sid, uid)
     except Exception:
-        logger.exception("finish_drive cleanup_failed: sid=%s uid=%s", sid, uid)
+        info = {}
     if resp.status_code not in (200, 201):
-        return jsonify({"ok": False, "error": f"drive_error {resp.status_code}: {resp.text[:500]}"}), 502
-    return jsonify({"ok": True, "id": info.get("id"), "name": info.get("name")})
+        return False, {"ok": False, "error": f"drive_error {resp.status_code}: {resp.text[:500]}"}
+    return True, info
+
+
+@app.post("/api/markdown/convert")
+def markdown_convert():
+    sid = _sid()
+    tok = get_valid_access_token(sid)
+    if not tok:
+        return jsonify({"ok": False, "error": "not_authed"}), 401
+    try:
+        body = request.get_json(force=True)
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid_json"}), 400
+    markdown_text = body.get("markdown") if isinstance(body, dict) else None
+    filename = (body.get("filename") or "").strip() if isinstance(body, dict) else ""
+    if not isinstance(markdown_text, str) or not markdown_text.strip():
+        return jsonify({"ok": False, "error": "missing_markdown"}), 400
+    filename = os.path.basename(filename)
+    if not filename:
+        filename = "document.docx"
+    if not pathlib.Path(filename).suffix:
+        filename = f"{filename}.docx" if not filename.lower().endswith(".docx") else filename
+    suffix = pathlib.Path(filename).suffix or ".docx"
+    uid = uuid.uuid4().hex
+    workdir = _udir(sid, uid)
+    input_md = workdir / "input.md"
+    output_file = workdir / f"output{suffix}"
+    try:
+        input_md.write_text(markdown_text, encoding="utf-8")
+    except Exception as e:
+        logger.exception("markdown_convert write_failed: sid=%s uid=%s", sid, uid)
+        return jsonify({"ok": False, "error": f"write_failed: {e}"}), 500
+    try:
+        subprocess.run(["pandoc", str(input_md), "-o", str(output_file)], check=True, timeout=300)
+    except FileNotFoundError:
+        logger.exception("markdown_convert pandoc_missing: sid=%s uid=%s", sid, uid)
+        return jsonify({"ok": False, "error": "pandoc_not_found"}), 500
+    except subprocess.CalledProcessError as e:
+        logger.exception("markdown_convert pandoc_failed: sid=%s uid=%s", sid, uid)
+        return jsonify({"ok": False, "error": f"pandoc_failed: {e.returncode}"}), 500
+    except subprocess.TimeoutExpired:
+        logger.exception("markdown_convert pandoc_timeout: sid=%s uid=%s", sid, uid)
+        return jsonify({"ok": False, "error": "pandoc_timeout"}), 504
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    if not output_file.exists() or output_file.stat().st_size == 0:
+        return jsonify({"ok": False, "error": "conversion_failed"}), 500
+    ok, info = _drive_upload(sid, tok, output_file, filename, mime)
+    try:
+        shutil.rmtree(workdir, ignore_errors=True)
+    except Exception:
+        logger.exception("markdown_convert cleanup_failed: sid=%s uid=%s", sid, uid)
+    if not ok:
+        return jsonify(info), 502
+    return jsonify({"ok": True, "id": info.get("id"), "name": info.get("name", filename)})
 
 
 # ── Debug endpoint ────────────────────────────────────────────────────────────
