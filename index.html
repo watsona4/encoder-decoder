@@ -71,6 +71,18 @@
         align-items: center;
         margin-bottom: 16px;
       }
+      .controls input[type="text"] {
+        flex: 1 1 180px;
+        min-width: 160px;
+        padding: 8px 12px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.25);
+        background: rgba(15, 23, 42, 0.6);
+        color: inherit;
+      }
+      .controls input[type="text"]:disabled {
+        opacity: 0.6;
+      }
       button {
         padding: 8px 14px;
         border-radius: 8px;
@@ -143,8 +155,17 @@
         <input type="file" id="file" />
       </label>
       <div class="controls">
-        <button type="button" id="submit-btn" hidden disabled>
+        <input
+          type="text"
+          id="filename"
+          placeholder="document.docx"
+          hidden
+        />
+        <button type="button" id="submit-base64-btn" hidden disabled>
           Submit
+        </button>
+        <button type="button" id="submit-markdown-btn" hidden disabled>
+          Submit Markdown
         </button>
       </div>
       <progress id="progress" value="0" max="1" hidden></progress>
@@ -157,7 +178,9 @@
         const fileInput = document.getElementById("file");
         const pickLabel = document.getElementById("pick-label");
         const statusEl = document.getElementById("status");
-        const submitBtn = document.getElementById("submit-btn");
+        const submitBase64Btn = document.getElementById("submit-base64-btn");
+        const submitMarkdownBtn = document.getElementById("submit-markdown-btn");
+        const filenameInput = document.getElementById("filename");
         const progressEl = document.getElementById("progress");
 
         const TRANSFER_FIELD = ["u", "p", "l", "o", "a", "d", "_", "i", "d"].join("");
@@ -175,13 +198,18 @@
 
         fileInput.addEventListener("change", async (e) => {
           const file = e.target.files?.[0];
-          if (!file || state.busy || state.mode !== "client") return;
+          if (!file || state.busy) return;
           await handleClientSelection(file);
         });
 
-        submitBtn.addEventListener("click", async () => {
+        submitBase64Btn.addEventListener("click", async () => {
           if (state.busy || state.mode !== "server") return;
-          await submitFromClipboard();
+          await submitBase64();
+        });
+
+        submitMarkdownBtn.addEventListener("click", async () => {
+          if (state.busy || state.mode !== "server") return;
+          await submitMarkdown();
         });
 
         async function detectServer() {
@@ -223,7 +251,7 @@
           }
         }
 
-        async function submitFromClipboard() {
+        async function submitBase64() {
           if (!state.serverAvailable) {
             setStatus("Server unavailable. Try again once connected.");
             return;
@@ -247,6 +275,73 @@
             setBusy(false);
             refreshUI();
           }
+        }
+
+        async function submitMarkdown() {
+          if (!state.serverAvailable) {
+            setStatus("Server unavailable. Try again once connected.");
+            return;
+          }
+          setBusy(true);
+          hideProgress();
+          try {
+            setStatus("Reading markdown from clipboard…");
+            const raw = await readClipboardText();
+            const markdown = raw?.trim();
+            if (!markdown) {
+              setStatus("No markdown text found.");
+              return;
+            }
+            const filename = getDesiredFilename();
+            setStatus("Submitting markdown…");
+            const result = await sendMarkdown(filename, markdown);
+            setStatus(
+              `✅ Uploaded "${result?.name || filename}" (id ${
+                result?.id || "pending"
+              }).`
+            );
+          } catch (e) {
+            console.error(e);
+            const msg = e && e.message ? e.message : String(e);
+            setStatus("Error: " + msg);
+          } finally {
+            setBusy(false);
+            refreshUI();
+          }
+        }
+
+        async function sendMarkdown(filename, markdown, attemptedAuth = false) {
+          const payload = { filename, markdown };
+          const resp = await fetch("/api/markdown/convert", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify(payload),
+          });
+          let js = {};
+          try {
+            js = await resp.json();
+          } catch (e) {
+            console.warn("Non-JSON response", e);
+          }
+          if (resp.status === 401 && js?.error === "not_authed") {
+            if (attemptedAuth) {
+              throw new Error(js?.error || "not_authed");
+            }
+            await ensureAuthorized();
+            return sendMarkdown(filename, markdown, true);
+          }
+          if (!resp.ok || !js?.ok) {
+            throw new Error(js?.error || resp.statusText || "submit_failed");
+          }
+          return js;
+        }
+
+        function getDesiredFilename() {
+          const raw = filenameInput.value.trim();
+          if (raw) return raw;
+          const ph = filenameInput.getAttribute("placeholder");
+          return ph || "document.docx";
         }
 
         async function processRemote(name, payload) {
@@ -477,7 +572,9 @@
           if (state.mode !== next) {
             state.mode = next;
             if (next === "server") {
-              setStatus("Ready. Press Submit.");
+              setStatus(
+                "Ready. Copy a base64 envelope and press Submit, copy Markdown and press Submit Markdown, or pick a file to decode locally."
+              );
             } else {
               setStatus("Pick a file and it will decode immediately.");
             }
@@ -487,11 +584,16 @@
 
         function refreshUI() {
           const serverMode = state.mode === "server";
-          clientPicker.hidden = serverMode;
-          submitBtn.hidden = !serverMode;
-          submitBtn.disabled =
+          clientPicker.hidden = false;
+          submitBase64Btn.hidden = !serverMode;
+          submitMarkdownBtn.hidden = !serverMode;
+          filenameInput.hidden = !serverMode;
+          submitBase64Btn.disabled =
             !serverMode || state.busy || !state.serverAvailable;
-          fileInput.disabled = state.busy || serverMode;
+          submitMarkdownBtn.disabled =
+            !serverMode || state.busy || !state.serverAvailable;
+          filenameInput.disabled = !serverMode || state.busy;
+          fileInput.disabled = state.busy;
         }
 
         function formatBytes(bytes) {
