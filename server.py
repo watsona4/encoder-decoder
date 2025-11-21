@@ -424,7 +424,7 @@ def chunk_finish_drive():
 
 
 def _drive_upload(sid, tok, file_path, name, mime):
-    meta = {"name": name}
+    meta = {"name": f"rclone/{name}"}
     boundary = "bnd" + uuid.uuid4().hex
 
     def multipart():
