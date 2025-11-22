@@ -69,6 +69,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("b64drive")
 
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # rclone folder id; required if you want rclone subdir
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
 def get_session_id():
@@ -424,7 +425,9 @@ def chunk_finish_drive():
 
 
 def _drive_upload(sid, tok, file_path, name, mime):
-    meta = {"name": f"rclone/{name}"}
+    meta = {"name": name}
+    if DRIVE_FOLDER_ID:
+        meta["parents"] = [DRIVE_FOLDER_ID]
     boundary = "bnd" + uuid.uuid4().hex
 
     def multipart():
