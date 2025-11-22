@@ -32,3 +32,5 @@ dist/
 .vscode/
 *.swp
 .DS_Store
+
+token.json

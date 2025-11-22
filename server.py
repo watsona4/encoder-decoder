@@ -16,6 +16,8 @@ import re
 import redis
 import requests
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GARequest
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8000"))
@@ -69,6 +71,9 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("b64drive")
 
+# Optional Service Account + target folder support
+GDRIVE_USE_SERVICE_ACCOUNT = os.getenv("GDRIVE_USE_SERVICE_ACCOUNT", "false").lower() in ("1","true","yes")
+SA_KEY_FILE = os.getenv("SA_KEY_FILE")  # path to service-account JSON in container
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # rclone folder id; required if you want rclone subdir
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
@@ -128,6 +133,17 @@ def get_valid_access_token(sid):
         if not tok:
             return None
     return tok["access_token"]
+
+def get_sa_access_token():
+    """Fetch an access token using the service account, scoped to Drive."""
+    if not SA_KEY_FILE:
+        raise RuntimeError("SA_KEY_FILE not set")
+    creds = service_account.Credentials.from_service_account_file(
+        SA_KEY_FILE,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    creds.refresh(GARequest())
+    return creds.token
 
 
 AUTOLINK_RE = re.compile(r"<([^>\s]+)>")
@@ -382,9 +398,17 @@ def chunk_finish_download():
 @app.post("/api/chunk/finish/drive")
 def chunk_finish_drive():
     sid = _sid()
-    tok = get_valid_access_token(sid)
-    if not tok:
-        return jsonify({"ok": False, "error": "not_authed"}), 401
+    # Choose auth mode
+    if GDRIVE_USE_SERVICE_ACCOUNT:
+        try:
+            tok = get_sa_access_token()
+        except Exception as e:
+            logger.exception("service_account_token_failed")
+            return jsonify({"ok": False, "error": f"sa_auth_failed: {e}"}), 500
+    else:
+        tok = get_valid_access_token(sid)
+        if not tok:
+            return jsonify({"ok": False, "error": "not_authed"}), 401
     b = request.get_json(force=True)
     uid = b.get("upload_id")
     name = b.get("name", "file.bin")

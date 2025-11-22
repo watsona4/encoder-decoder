@@ -12,3 +12,5 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    volumes:
+      - ./token.json:/run/secrets/sa.json:ro
