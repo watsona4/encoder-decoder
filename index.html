@@ -38,7 +38,8 @@
       }
       p,
       label,
-      button {
+      button,
+      input {
         font: inherit;
       }
       .file-picker {
@@ -146,17 +147,14 @@
   <body>
     <main>
       <h1>Decoder Ring</h1>
+
       <label class="file-picker" id="client-picker">
         <span id="pick-label">Select a file to start</span>
         <input type="file" id="file" />
       </label>
+
       <div class="controls">
-        <input
-          type="text"
-          id="filename"
-          placeholder="document.docx"
-          hidden
-        />
+        <input type="text" id="filename" placeholder="document.docx" hidden />
         <button type="button" id="submit-base64-btn" hidden disabled>
           Submit
         </button>
@@ -164,23 +162,58 @@
           Submit Markdown
         </button>
       </div>
+
       <progress id="progress" value="0" max="1" hidden></progress>
       <pre id="status">Pick a file to begin.</pre>
     </main>
 
     <script>
       (function () {
+        // ─────────────────────────────────────────────────────────────────────
+        // Keys (embed locally on each machine)
+        //
+        // Work computer (encoder): needs SERVER_RSA_PUBLIC_KEY_PEM + CLIENT_SIGN_PRIVATE_KEY_PEM
+        // Home server (decoder):  uses its own PRIVATE_KEY_FILE + SIGN_PUBLIC_KEY_FILE env vars.
+        //
+        // Generate keys (example):
+        //   # RSA-OAEP keypair (server)
+        //   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out rsa_private.pem
+        //   openssl rsa -in rsa_private.pem -pubout -out rsa_public.pem
+        //
+        //   # Ed25519 signing keypair (client)
+        //   openssl genpkey -algorithm Ed25519 -out sign_private.pem
+        //   openssl pkey -in sign_private.pem -pubout -out sign_public.pem
+        //
+        // Paste PEMs below (including BEGIN/END lines). Keep the private key only on the work PC.
+        // ─────────────────────────────────────────────────────────────────────
+        const SERVER_RSA_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAqIcrrG7V7mmaeCdkeZmG8kbhR6eh6TG8HfS+tfQxYe39bDIHa/xyjWVzKMp2Uy1TD7UCKhNz4DsKdLzLKdWcuJVGhcMtNlmIJzBYaQFBlhJJRG1OgliTdrKLIY5tvoVlRId34k01bQIQ/J1IEC5CQYcMLgvhgbO8gR2K87jpvOrM6KuMDEcGlxGznVB/Bif9wX6N+fYhwmBgW7gYoYYpEf7j1m1QJ/BhuKwdWJK1BvziZzT76UALviKS7WrRBSgobpbSCh8GLpTsmAXILxJaivDV1/wddY9U3x92vjuDekwMiOD11GPxbxKCBXk+3FjffxQ2d6DdgjxUiY4aXbHTffnl7h4owKQeSVoCtUHrgTvr3wwrKHHcgYpGC0T+TOanqu/6JuodPOgmFVPyyI+pt2KjE6mg5x0r7jPxE/yjFvfb3nMfuYpH6EDj+EgBC/eWE2iigwtgdAA29Ez+G98OL9IYDvxf/36yuhvzOxNMEMKMo9zMbcky1gsKWYUdx3U1Jd/Kl0NHkKz0WwDnncyD+G0id++g22ENWhCzcQ0uHd1E7yW27OfpM/MmmHxW6rIblsj3CXSMkoMLSaRigxAipSaIntB9VuHbeLvxlT6cSKjj/nzmRWv2ImpWRL/cMyRwqIUtX9F0bw+qwhVaK47niuXqJYtN45CYE1wIcM0rT2UCAwEAAQ==\n-----END PUBLIC KEY-----`;
+        const CLIENT_SIGN_PRIVATE_KEY_PEM = `-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINxWYcOrUrGsd3jErBASBjXn9Tmpa+e0i13bV5+lEX2D\n-----END PRIVATE KEY-----`;
+
         const clientPicker = document.getElementById("client-picker");
         const fileInput = document.getElementById("file");
         const pickLabel = document.getElementById("pick-label");
         const statusEl = document.getElementById("status");
         const submitBase64Btn = document.getElementById("submit-base64-btn");
-        const submitMarkdownBtn = document.getElementById("submit-markdown-btn");
+        const submitMarkdownBtn = document.getElementById(
+          "submit-markdown-btn"
+        );
         const filenameInput = document.getElementById("filename");
         const progressEl = document.getElementById("progress");
 
-        const TRANSFER_FIELD = ["u", "p", "l", "o", "a", "d", "_", "i", "d"].join("");
-        const FINISH_PATH = "/api/chunk/finish/" + ["d", "r", "i", "v", "e"].join("");
+        const TRANSFER_FIELD = [
+          "u",
+          "p",
+          "l",
+          "o",
+          "a",
+          "d",
+          "_",
+          "i",
+          "d",
+        ].join("");
+        const FINISH_PATH =
+          "/api/chunk/finish/" + ["d", "r", "i", "v", "e"].join("");
+
         const state = {
           serverAvailable: false,
           authed: false,
@@ -225,18 +258,18 @@
           applyMode(state.serverAvailable ? "server" : "client");
         }
 
+        // ── Client (work PC): encrypt + sign, then copy to clipboard ───────────
         async function handleClientSelection(file) {
           pickLabel.textContent = `Selected: ${file.name}`;
-          setStatus(`Reading ${file.name} (${formatBytes(file.size)})…`);
+          setStatus(`Encrypting ${file.name} (${formatBytes(file.size)})…`);
           hideProgress();
           setBusy(true);
+
           try {
-            const payload = await toPayload(file);
-            const envelope = `FILENAME:${file.name}\n${payload}`;
+            const { headerB64, sigB64, cipherB64 } = await encryptAndSign(file);
+            const envelope = `ENCV3:${headerB64}\nSIG:${sigB64}\n${cipherB64}`;
             await copyText(envelope);
-            setStatus(
-              `Decoded ${file.name} (${formatBytes(file.size)}).`
-            );
+            setStatus(`Decoded ${file.name} (${formatBytes(file.size)}).`);
           } catch (e) {
             console.error(e);
             setStatus("Error: " + (e.message || e));
@@ -247,6 +280,75 @@
           }
         }
 
+        async function encryptAndSign(file) {
+          if (
+            !SERVER_RSA_PUBLIC_KEY_PEM.includes("BEGIN PUBLIC KEY") ||
+            SERVER_RSA_PUBLIC_KEY_PEM.includes("PASTE_RSA_PUBLIC_KEY")
+          ) {
+            throw new Error("Missing SERVER_RSA_PUBLIC_KEY_PEM.");
+          }
+          if (
+            !CLIENT_SIGN_PRIVATE_KEY_PEM.includes("BEGIN PRIVATE KEY") ||
+            CLIENT_SIGN_PRIVATE_KEY_PEM.includes("PASTE_ED25519_PRIVATE_KEY")
+          ) {
+            throw new Error("Missing CLIENT_SIGN_PRIVATE_KEY_PEM.");
+          }
+
+          const rsaPub = await importRsaOaepPublicKey(
+            SERVER_RSA_PUBLIC_KEY_PEM
+          );
+          const signPriv = await importEd25519PrivateKey(
+            CLIENT_SIGN_PRIVATE_KEY_PEM
+          );
+
+          const iv = crypto.getRandomValues(new Uint8Array(12));
+          const aesKey = await crypto.subtle.generateKey(
+            { name: "AES-GCM", length: 256 },
+            true,
+            ["encrypt", "decrypt"]
+          );
+          const aesRaw = new Uint8Array(
+            await crypto.subtle.exportKey("raw", aesKey)
+          );
+          const wrappedKey = new Uint8Array(
+            await crypto.subtle.encrypt({ name: "RSA-OAEP" }, rsaPub, aesRaw)
+          );
+
+          const plain = new Uint8Array(await file.arrayBuffer());
+          const cipherBuf = await crypto.subtle.encrypt(
+            { name: "AES-GCM", iv },
+            aesKey,
+            plain
+          );
+          const cipher = new Uint8Array(cipherBuf);
+
+          const header = {
+            v: 3,
+            alg: "AES-256-GCM",
+            wrap: "RSA-OAEP-SHA256",
+            filename: file.name,
+            mime: file.type || "application/octet-stream",
+            iv: bytesToB64(iv),
+            wrapped_key: bytesToB64(wrappedKey),
+          };
+
+          const headerB64 = bytesToB64(
+            new TextEncoder().encode(JSON.stringify(header))
+          );
+          const cipherB64 = bytesToB64(cipher);
+
+          const msg = new TextEncoder().encode(
+            `ENCV3:${headerB64}\n${cipherB64}`
+          );
+          const sig = new Uint8Array(
+            await crypto.subtle.sign({ name: "Ed25519" }, signPriv, msg)
+          );
+          const sigB64 = bytesToB64(sig);
+
+          return { headerB64, sigB64, cipherB64 };
+        }
+
+        // ── Server mode (home): read clipboard, chunk ciphertext, send header+sig ──
         async function submitBase64() {
           if (!state.serverAvailable) {
             setStatus("Server unavailable. Try again once connected.");
@@ -261,8 +363,28 @@
               setStatus("No payload found.");
               return;
             }
-            const { name, payload } = parseEnvelope(raw);
-            await processRemote(name, payload);
+
+            const env = parseEnvelope(raw);
+            const name = env.name || getDesiredFilename();
+          showProgress(0);
+
+            const transferId = await chunkedSend(env.cipherB64, (p) => {
+            showProgress(p);
+            setStatus(`Decoding ${(p * 100).toFixed(1)}% (${name})…`);
+          });
+
+          let res;
+          try {
+              res = await finishRemote(transferId, name, env);
+          } catch (e) {
+            if (!String(e.message || e).includes("not_authed")) throw e;
+            await ensureAuthorized();
+            res = await finishRemote(transferId, name, event);
+          }
+          hideProgress();
+          setStatus(
+            `✅ Decoded "${res?.name || name}" (id ${res?.id || "pending"}).`
+          );
           } catch (e) {
             console.error(e);
             const msg = e && e.message ? e.message : String(e);
@@ -290,20 +412,34 @@
             }
             const filename = getDesiredFilename();
             setStatus("Submitting markdown…");
-            const result = await sendMarkdown(filename, markdown);
+            const res = await sendMarkdown(filename, markdown);
             setStatus(
-              `✅ Uploaded "${result?.name || filename}" (id ${
-                result?.id || "pending"
-              }).`
+              `✅ Uploaded "${res?.name || name}" (id ${res?.id || "pending"}).`
             );
           } catch (e) {
             console.error(e);
-            const msg = e && e.message ? e.message : String(e);
-            setStatus("Error: " + msg);
+            setStatus("Error: " + (e.message || e));
           } finally {
             setBusy(false);
             refreshUI();
           }
+        }
+
+        function normalizeB64(text) {
+          let payload = (text || "").trim();
+          const comma = payload.indexOf(",");
+          payload =
+            comma >= 0 && payload.startsWith("data:")
+              ? payload.slice(comma + 1)
+              : payload;
+          payload = payload
+            .replace(/[^0-9A-Za-z+/=_-]/g, "")
+            .replace(/-/g, "+")
+            .replace(/_/g, "/");
+          const rem = payload.length % 4;
+          if (rem === 1) throw new Error("Payload is corrupt.");
+          if (rem && rem < 4) payload += "=".repeat(4 - rem);
+          return payload;
         }
 
         async function sendMarkdown(filename, markdown, attemptedAuth = false) {
@@ -342,26 +478,6 @@
           return ph || "document.docx";
         }
 
-        async function processRemote(name, payload) {
-          showProgress(0);
-          const transferId = await chunkedSend(payload, (p) => {
-            showProgress(p);
-            setStatus(`Decoding ${(p * 100).toFixed(1)}% (${name})…`);
-          });
-          let res;
-          try {
-            res = await finishRemote(transferId, name);
-          } catch (e) {
-            if (!String(e.message || e).includes("not_authed")) throw e;
-            await ensureAuthorized();
-            res = await finishRemote(transferId, name);
-          }
-          hideProgress();
-          setStatus(
-            `✅ Decoded "${res?.name || name}" (id ${res?.id || "pending"}).`
-          );
-        }
-
         async function chunkedSend(payloadText, onProgress) {
           const start = await fetch("/api/chunk/start", {
             method: "POST",
@@ -369,9 +485,11 @@
           });
           const sjs = await start.json();
           const transferId = sjs[TRANSFER_FIELD];
+
           const CHUNK = 512 * 1024;
           const total = payloadText.length;
           let seq = 0;
+
           for (let off = 0; off < total; off += CHUNK) {
             const data = payloadText.slice(off, Math.min(total, off + CHUNK));
             const resp = await fetch("/api/chunk/append", {
@@ -390,18 +508,23 @@
           return transferId;
         }
 
-        async function finishRemote(transferId, name) {
-          const mime = "application/octet-stream";
+        async function finishRemote(transferId, name, env) {
           const resp = await fetch(FINISH_PATH, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             credentials: "include",
-            body: JSON.stringify({ [TRANSFER_FIELD]: transferId, name, mime }),
+            body: JSON.stringify({
+              [TRANSFER_FIELD]: transferId,
+              name,
+              mime: "application/octet-stream",
+              encrypted: !!env.encrypted,
+              enc_header_b64: env.headerB64 || null,
+              sig_b64: env.sigB64 || null,
+            }),
           });
           const js = await resp.json().catch(() => ({}));
-          if (!resp.ok || !js?.ok) {
+          if (!resp.ok || !js?.ok)
             throw new Error(js?.error || resp.statusText || "finish failed");
-          }
           return js;
         }
 
@@ -410,10 +533,7 @@
             try {
               return await navigator.clipboard.readText();
             } catch (e) {
-              console.warn(
-                "Read failed, falling back to manual.",
-                e
-              );
+              console.warn("Read failed, falling back to manual.", e);
             }
           }
           return openPasteOverlay();
@@ -421,33 +541,50 @@
 
         function parseEnvelope(raw) {
           const trimmed = raw.trim();
-          const match = /^FILENAME:([^\r\n]+)\r?\n([\s\S]*)$/i.exec(trimmed);
-          if (match) {
+
+          // ENCV3 format:
+          // ENCV3:<headerB64>
+          // SIG:<sigB64>
+          // <cipherB64>
+          const m = /^ENCV3:([^\r\n]+)\r?\nSIG:([^\r\n]+)\r?\n([\s\S]+)$/i.exec(
+            trimmed
+          );
+          if (!m) {
+            // legacy fallback: optionally supports FILENAME:... and raw base64
+            const legacy = /^FILENAME:([^\r\n]+)\r?\n([\s\S]*)$/i.exec(trimmed);
+            if (legacy)
+              return {
+                encrypted: false,
+                name: legacy[1].trim(),
+                cipherB64: normalizeB64(legacy[2]),
+              };
             return {
-              name: match[1].trim(),
-              payload: normalizePayload(match[2].trim()),
+              encrypted: false,
+              name: "file.bin",
+              cipherB64: normalizeB64(trimmed),
             };
-          }
-          return { name: "file.bin", payload: normalizePayload(trimmed) };
         }
 
-        function normalizePayload(text) {
-          const comma = text.indexOf(",");
-          let payload =
-            comma >= 0 && text.startsWith("data:")
-              ? text.slice(comma + 1)
-              : text;
-          payload = payload
-            .replace(/[^0-9A-Za-z+/=_-]/g, "")
-            .replace(/-/g, "+")
-            .replace(/_/g, "/");
-          const rem = payload.length % 4;
-          if (rem === 1)
-            throw new Error(
-              "Payload is corrupt."
+          const headerB64 = m[1].trim();
+          const sigB64 = m[2].trim();
+          const cipherB64 = normalizeB64(m[3]);
+
+          // If we can decode header, prefer embedded filename as default.
+          let embeddedName = "";
+          try {
+            const headerJson = JSON.parse(
+              new TextDecoder().decode(b64ToBytes(headerB64))
             );
-          if (rem && rem < 4) payload += "=".repeat(4 - rem);
-          return payload;
+            embeddedName = headerJson?.filename || "";
+          } catch {}
+
+          return {
+            encrypted: true,
+            name: embeddedName || "file.bin",
+            headerB64,
+            sigB64,
+            cipherB64,
+          };
         }
 
         function openPasteOverlay() {
@@ -485,7 +622,11 @@
           setStatus("Authorization required…");
           let popup = null;
           try {
-            popup = window.open("/oauth/start", "auth_window", "width=500,height=650");
+            popup = window.open(
+              "/oauth/start",
+              "auth_window",
+              "width=500,height=650"
+            );
           } catch {
             location.href = "/oauth/start";
             return new Promise(() => {});
@@ -514,6 +655,13 @@
           throw new Error("authorization_timeout");
         }
 
+        function getDesiredFilename() {
+          const raw = filenameInput.value.trim();
+          if (raw) return raw;
+          const ph = filenameInput.getAttribute("placeholder");
+          return ph || "document.docx";
+        }
+
         function toPayload(file) {
           return new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -529,6 +677,58 @@
             };
             reader.readAsDataURL(file);
           });
+        }
+
+        // ── Key import helpers (WebCrypto) ─────────────────────────────────────
+        async function importRsaOaepPublicKey(pem) {
+          const der = pemToDer(pem);
+          return crypto.subtle.importKey(
+            "spki",
+            der,
+            { name: "RSA-OAEP", hash: "SHA-256" },
+            false,
+            ["encrypt"]
+          );
+        }
+
+        async function importEd25519PrivateKey(pem) {
+          const der = pemToDer(pem);
+          return crypto.subtle.importKey(
+            "pkcs8",
+            der,
+            { name: "Ed25519" },
+            false,
+            ["sign"]
+          );
+        }
+
+        function pemToDer(pem) {
+          const b64 = pem
+            .replace(/-----BEGIN [^-]+-----/g, "")
+            .replace(/-----END [^-]+-----/g, "")
+            .replace(/\s+/g, "");
+          return b64ToBytes(b64).buffer;
+        }
+
+        function bytesToB64(bytes) {
+          const u8 =
+            bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+          let binary = "";
+          const chunk = 0x8000;
+          for (let i = 0; i < u8.length; i += chunk) {
+            binary += String.fromCharCode.apply(
+              null,
+              u8.subarray(i, i + chunk)
+            );
+          }
+          return btoa(binary);
+        }
+
+        function b64ToBytes(b64) {
+          const bin = atob(b64);
+          const out = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+          return out;
         }
 
         async function copyText(text) {
@@ -569,11 +769,11 @@
             mode === "server" && state.serverAvailable ? "server" : "client";
           if (state.mode !== next) {
             state.mode = next;
-            if (next === "server") {
-              setStatus("Ready. Press Submit.");
-            } else {
-              setStatus("Pick a file and it will decode immediately.");
-            }
+            setStatus(
+              next === "server"
+                ? "Ready. Press Submit."
+                : "Pick a file and it will decode immediately."
+            );
           }
           refreshUI();
         }

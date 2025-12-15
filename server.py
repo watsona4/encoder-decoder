@@ -5,19 +5,25 @@ import logging
 import mimetypes
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import subprocess
 import time
 import uuid
 from urllib.parse import urlencode, urlparse
-import re
 
 import redis
 import requests
-from flask import Flask, Response, jsonify, redirect, request, send_from_directory
-from google.oauth2 import service_account
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.serialization import (load_pem_private_key,
+                                                          load_pem_public_key)
+from flask import (Flask, Response, jsonify, redirect, request,
+                   send_from_directory)
 from google.auth.transport.requests import Request as GARequest
+from google.oauth2 import service_account
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8000"))
@@ -35,9 +41,23 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI", f"http://localhost:{PORT}/oauth/callback")
 
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+SA_DRIVE_SCOPE = os.getenv("SA_DRIVE_SCOPE", "https://www.googleapis.com/auth/drive")
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+GOOGLE_DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
+GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+
+# Optional Service Account + target folder support
+GDRIVE_USE_SERVICE_ACCOUNT = os.getenv("GDRIVE_USE_SERVICE_ACCOUNT", "false").lower() in ("1", "true", "yes")
+SA_KEY_FILE = os.getenv("SA_KEY_FILE")  # path to service-account JSON in container
+
+# Drive subfolder for uploads
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # explicit folder id override
+DRIVE_SUBFOLDER_NAME = os.getenv("DRIVE_SUBFOLDER_NAME", "rclone").strip() or "rclone"
+
+# Hybrid encryption / signing keys (server-side)
+PRIVATE_KEY_FILE = os.getenv("PRIVATE_KEY_FILE")  # RSA private key for unwrap (PEM)
+SIGN_PUBLIC_KEY_FILE = os.getenv("SIGN_PUBLIC_KEY_FILE")  # Ed25519 public key for verify (PEM)
 
 if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
     raise SystemExit("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET")
@@ -71,10 +91,62 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("b64drive")
 
-# Optional Service Account + target folder support
-GDRIVE_USE_SERVICE_ACCOUNT = os.getenv("GDRIVE_USE_SERVICE_ACCOUNT", "false").lower() in ("1","true","yes")
-SA_KEY_FILE = os.getenv("SA_KEY_FILE")  # path to service-account JSON in container
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # rclone folder id; required if you want rclone subdir
+# ── Key loading (lazy) ────────────────────────────────────────────────────────
+_RSA_PRIVATE = None
+_SIGN_PUB = None
+
+def _get_rsa_private():
+    global _RSA_PRIVATE
+    if _RSA_PRIVATE is not None:
+        return _RSA_PRIVATE
+    if not PRIVATE_KEY_FILE:
+        raise RuntimeError("PRIVATE_KEY_FILE not set")
+    with open(PRIVATE_KEY_FILE, "rb") as f:
+        _RSA_PRIVATE = load_pem_private_key(f.read(), password=None)
+    return _RSA_PRIVATE
+
+def _get_sign_pub():
+    global _SIGN_PUB
+    if _SIGN_PUB is not None:
+        return _SIGN_PUB
+    if not SIGN_PUBLIC_KEY_FILE:
+        raise RuntimeError("SIGN_PUBLIC_KEY_FILE not set")
+    with open(SIGN_PUBLIC_KEY_FILE, "rb") as f:
+        _SIGN_PUB = load_pem_public_key(f.read())
+    return _SIGN_PUB
+
+def _b64d(s: str) -> bytes:
+    return base64.b64decode(s.encode("utf-8"))
+
+def _verify_sig_encv3(header_b64: str, sig_b64: str, cipher_b64: str):
+    # Signature is over the exact, stable text:
+    #   "ENCV3:<headerB64>\n<cipherB64>"
+    msg = (f"ENCV3:{header_b64}\n{cipher_b64}").encode("utf-8")
+    sig = _b64d(sig_b64)
+    pub = _get_sign_pub()
+    pub.verify(sig, msg)  # raises on failure
+
+def _decrypt_encv3(header: dict, ciphertext: bytes) -> tuple[bytes, str]:
+    if header.get("v") not in (3, "3", None):
+        # still allow missing v for early drafts
+        pass
+    if header.get("wrap") != "RSA-OAEP-SHA256":
+        raise ValueError("unsupported_wrap")
+    if header.get("alg") != "AES-256-GCM":
+        raise ValueError("unsupported_alg")
+    iv = _b64d(header["iv"])
+    wrapped_key = _b64d(header["wrapped_key"])
+    priv = _get_rsa_private()
+    aes_key = priv.decrypt(
+        wrapped_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    plain = AESGCM(aes_key).decrypt(iv, ciphertext, None)
+    return plain, (header.get("filename") or "file.bin")
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
 def get_session_id():
@@ -140,7 +212,7 @@ def get_sa_access_token():
         raise RuntimeError("SA_KEY_FILE not set")
     creds = service_account.Credentials.from_service_account_file(
         SA_KEY_FILE,
-        scopes=["https://www.googleapis.com/auth/drive.file"],
+        scopes=[SA_DRIVE_SCOPE],
     )
     creds.refresh(GARequest())
     return creds.token
@@ -411,18 +483,17 @@ def chunk_finish_drive():
             return jsonify({"ok": False, "error": "not_authed"}), 401
     b = request.get_json(force=True)
     uid = b.get("upload_id")
+
+    encrypted = bool(b.get("encrypted"))
+    enc_header_b64 = b.get("enc_header_b64") if encrypted else None
+    sig_b64 = b.get("sig_b64") if encrypted else None
+
     name = b.get("name", "file.bin")
     mime = b.get("mime", "application/octet-stream")
     p = _b64p(sid, uid) if uid else None
-    logger.info(
-        "finish_drive in: sid=%s uid=%s name=%s mime=%s path=%s exists=%s",
-        sid,
-        uid,
-        name,
-        mime,
-        p,
-        p.exists() if p else False,
-    )
+    logger.info("finish_drive in: sid=%s uid=%s encrypted=%s name=%s mime=%s path=%s exists=%s",
+                sid, uid, encrypted, name, mime, p, p.exists() if p else False)
+
     if not uid:
         return jsonify({"ok": False, "error": "bad_args"}), 400
     if not p.exists():
@@ -430,29 +501,116 @@ def chunk_finish_drive():
         return jsonify({"ok": False, "error": "unknown_upload"}), 404
     out = _udir(sid, uid) / "payload.bin"
     try:
-        with open(out, "wb") as o:
-            for c in _iter_b64_file_decode(p):
-                o.write(c)
-        logger.info("finish_drive decode_done: sid=%s uid=%s out=%s size=%s", sid, uid, out, out.stat().st_size)
-    except Exception:
-        logger.exception("finish_drive decode_failed: sid=%s uid=%s", sid, uid)
-        return jsonify({"ok": False, "error": "decode_failed"}), 500
-    ok, payload = _drive_upload(sid, tok, out, name, mime)
+        # decode stored base64 to raw bytes (ciphertext if encrypted, plaintext if not)
+        raw = bytearray()
+        for c in _iter_b64_file_decode(p):
+            raw.extend(c)
+
+        if encrypted:
+            if not enc_header_b64 or not sig_b64:
+                return jsonify({"ok": False, "error": "missing_enc_params"}), 400
+
+            # Reconstruct ciphertext base64 as signed: remove whitespace/newlines.
+            cipher_b64 = p.read_text("utf-8", errors="ignore")
+            cipher_b64 = cipher_b64.replace("\r", "").replace("\n", "").replace(" ", "")
+            _verify_sig_encv3(enc_header_b64, sig_b64, cipher_b64)
+
+            header = json.loads(base64.b64decode(enc_header_b64).decode("utf-8"))
+            plain, fname = _decrypt_encv3(header, bytes(raw))
+
+            # Prefer embedded filename if present
+            name = fname or name
+            mime = header.get("mime") or mime
+
+            with open(out, "wb") as o:
+                o.write(plain)
+            logger.info("finish_drive verified+decrypted: sid=%s uid=%s out=%s size=%s", sid, uid, out, out.stat().st_size)
+        else:
+            with open(out, "wb") as o:
+                o.write(bytes(raw))
+            logger.info("finish_drive decoded: sid=%s uid=%s out=%s size=%s", sid, uid, out, out.stat().st_size)
+
+    except Exception as e:
+        logger.exception("finish_drive decode_or_decrypt_failed: sid=%s uid=%s", sid, uid)
+        if e.__class__.__name__ == "InvalidSignature":
+            return jsonify({"ok": False, "error": "bad_signature"}), 400
+        return jsonify({"ok": False, "error": f"decode_failed: {e}"}), 500
+
     try:
-        shutil.rmtree(_udir(sid, uid), ignore_errors=True)
-        logger.info("finish_drive cleanup_ok: sid=%s uid=%s", sid, uid)
-    except Exception:
-        logger.exception("finish_drive cleanup_failed: sid=%s uid=%s", sid, uid)
+        ok, payload = _drive_upload(sid, tok, out, name, mime)
+    finally:
+        try:
+            shutil.rmtree(_udir(sid, uid), ignore_errors=True)
+            logger.info("finish_drive cleanup_ok: sid=%s uid=%s", sid, uid)
+        except Exception:
+            logger.exception("finish_drive cleanup_failed: sid=%s uid=%s", sid, uid)
+
     if not ok:
         return jsonify(payload), 502
     return jsonify({"ok": True, "id": payload.get("id"), "name": payload.get("name")})
 
+# ── Drive folder helpers ──────────────────────────────────────────────────────
+_RCLONE_FOLDER_CACHE_KEY = b"b64drive:rclone_folder_id:v1"
+_RCLONE_FOLDER_ID = None
+
+def _drive_headers(tok):
+    return {"Authorization": f"Bearer {tok}"}
+
+def _ensure_drive_folder(tok) -> str | None:
+    """Return a folder id to upload into. Prefers DRIVE_FOLDER_ID; else ensures DRIVE_SUBFOLDER_NAME exists."""
+    global _RCLONE_FOLDER_ID
+    if DRIVE_FOLDER_ID:
+        return DRIVE_FOLDER_ID
+
+    if _RCLONE_FOLDER_ID:
+        return _RCLONE_FOLDER_ID
+
+    try:
+        cached = r.get(_RCLONE_FOLDER_CACHE_KEY)
+        if cached:
+            _RCLONE_FOLDER_ID = cached.decode("utf-8")
+            return _RCLONE_FOLDER_ID
+    except Exception:
+        pass
+
+    name = DRIVE_SUBFOLDER_NAME
+    q = f"name='{name.replace("'", "\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    params = {"q": q, "fields": "files(id,name)", "spaces": "drive", "pageSize": "10"}
+    resp = requests.get(GOOGLE_DRIVE_FILES_URL, headers=_drive_headers(tok), params=params, timeout=20)
+    if resp.status_code == 200:
+        files = (resp.json() or {}).get("files") or []
+        if files:
+            _RCLONE_FOLDER_ID = files[0]["id"]
+            try:
+                r.setex(_RCLONE_FOLDER_CACHE_KEY, 60 * 60 * 24, _RCLONE_FOLDER_ID.encode())
+            except Exception:
+                pass
+            return _RCLONE_FOLDER_ID
+
+    # Create folder
+    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    cresp = requests.post(GOOGLE_DRIVE_FILES_URL, headers={**_drive_headers(tok), "Content-Type": "application/json"},
+                          data=json.dumps(meta).encode(), timeout=20)
+    if cresp.status_code in (200, 201):
+        _RCLONE_FOLDER_ID = (cresp.json() or {}).get("id")
+        if _RCLONE_FOLDER_ID:
+            try:
+                r.setex(_RCLONE_FOLDER_CACHE_KEY, 60 * 60 * 24, _RCLONE_FOLDER_ID.encode())
+            except Exception:
+                pass
+            return _RCLONE_FOLDER_ID
+
+    logger.warning("could_not_ensure_folder: name=%s status=%s body=%s", name, cresp.status_code, cresp.text[:300])
+    return None
 
 def _drive_upload(sid, tok, file_path, name, mime):
+    folder_id = _ensure_drive_folder(tok)
     meta = {"name": name}
-    if DRIVE_FOLDER_ID:
-        meta["parents"] = [DRIVE_FOLDER_ID]
+    if folder_id:
+        meta["parents"] = [folder_id]
+
     boundary = "bnd" + uuid.uuid4().hex
+    upload_params = {"uploadType": "multipart"}
 
     def multipart():
         yield f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode()
@@ -470,12 +628,13 @@ def _drive_upload(sid, tok, file_path, name, mime):
         "Authorization": f"Bearer {tok}",
         "Content-Type": f"multipart/related; boundary={boundary}",
     }
-    resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, data=multipart(), timeout=600)
-    if resp.status_code not in (200, 201):
+    resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, params=upload_params, data=multipart(), timeout=600)
+    if resp.status_code not in (200, 201) and not GDRIVE_USE_SERVICE_ACCOUNT:
         new = refresh_access_token(sid, load_tokens(sid) or {})
         if new:
             headers["Authorization"] = f"Bearer {new['access_token']}"
-            resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, data=multipart(), timeout=600)
+            resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, params=upload_params, data=multipart(), timeout=600)
+
     try:
         info = resp.json()
     except Exception:
@@ -500,16 +659,9 @@ def markdown_convert():
     if not isinstance(markdown_text, str) or not markdown_text.strip():
         return jsonify({"ok": False, "error": "missing_markdown"}), 400
     if _has_local_reference(markdown_text):
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "error": "local_references_forbidden",
-                    "message": "Markdown references local files or include directives, which is not allowed.",
-                }
-            ),
-            400,
-        )
+        return jsonify({"ok": False, "error": "local_references_forbidden",
+                        "message": "Markdown references local files or include directives, which is not allowed."}), 400
+
     filename = os.path.basename(filename)
     if not filename:
         filename = "document.docx"
