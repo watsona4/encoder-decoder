@@ -369,7 +369,8 @@
           const headerB64 = bytesToB64(
             new TextEncoder().encode(JSON.stringify(header))
           );
-          const cipherB64 = cipherChunks.map((c) => bytesToB64(c)).join("");
+          const cipherBytes = joinChunks(cipherChunks);
+          const cipherB64 = bytesToB64(cipherBytes);
 
           const msg = new TextEncoder().encode(
             `ENCV3:${headerB64}\n${cipherB64}`
@@ -394,6 +395,17 @@
           const buf = new ArrayBuffer(4);
           new DataView(buf).setUint32(0, index, false);
           return new Uint8Array(buf);
+        }
+
+        function joinChunks(chunks) {
+          const total = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+          const out = new Uint8Array(total);
+          let offset = 0;
+          for (const chunk of chunks) {
+            out.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
+          return out;
         }
 
         // ── Server mode (home): read clipboard, chunk ciphertext, send header+sig ──
