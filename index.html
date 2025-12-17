@@ -292,7 +292,7 @@
             CLIENT_SIGN_PRIVATE_KEY_PEM
           );
 
-          const iv = crypto.getRandomValues(new Uint8Array(12));
+          const ivBase = crypto.getRandomValues(new Uint8Array(12));
           const aesKey = await crypto.subtle.generateKey(
             { name: "AES-GCM", length: 256 },
             true,
@@ -309,13 +309,48 @@
             )
           );
 
-          const plain = new Uint8Array(await file.arrayBuffer());
-          const cipherBuf = await crypto.subtle.encrypt(
-            { name: "AES-GCM", iv },
-            aesKey,
-            plain
-          );
-          const cipher = new Uint8Array(cipherBuf);
+          const reader = file.stream().getReader();
+          const cipherChunks = [];
+          let idx = 0;
+          let lastChunkBytes = 0;
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            const plainChunk = new Uint8Array(value);
+            lastChunkBytes = plainChunk.byteLength;
+            const iv = deriveChunkIv(ivBase, idx);
+            const cipherChunk = new Uint8Array(
+              await crypto.subtle.encrypt(
+                {
+                  name: "AES-GCM",
+                  iv,
+                  additionalData: chunkAdditionalData(idx),
+                },
+                aesKey,
+                plainChunk
+              )
+            );
+            cipherChunks.push(cipherChunk);
+            idx++;
+          }
+
+          const chunkCount = idx || 1;
+          if (!cipherChunks.length) {
+            cipherChunks.push(
+              new Uint8Array(
+                await crypto.subtle.encrypt(
+                  {
+                    name: "AES-GCM",
+                    iv: deriveChunkIv(ivBase, 0),
+                    additionalData: chunkAdditionalData(0),
+                  },
+                  aesKey,
+                  new Uint8Array()
+                )
+              )
+            );
+            lastChunkBytes = 0;
+          }
 
           const header = {
             v: 3,
@@ -323,14 +358,18 @@
             wrap: "RSA-OAEP-SHA256",
             filename: file.name,
             mime: file.type || "application/octet-stream",
-            iv: bytesToB64(iv),
+            iv: bytesToB64(ivBase),
+            iv_base: bytesToB64(ivBase),
+            chunk_size: CHUNK_SIZE,
+            chunk_count: chunkCount,
+            last_chunk_bytes: lastChunkBytes,
             wrapped_key: bytesToB64(wrappedKey),
           };
 
           const headerB64 = bytesToB64(
             new TextEncoder().encode(JSON.stringify(header))
           );
-          const cipherB64 = bytesToB64(cipher);
+          const cipherB64 = cipherChunks.map((c) => bytesToB64(c)).join("");
 
           const msg = new TextEncoder().encode(
             `ENCV3:${headerB64}\n${cipherB64}`
@@ -341,6 +380,20 @@
           const sigB64 = bytesToB64(sig);
 
           return { headerB64, sigB64, cipherB64, cipherBytes: cipher };
+        }
+
+        function deriveChunkIv(ivBase, index) {
+          const iv = new Uint8Array(ivBase);
+          const dv = new DataView(iv.buffer, iv.byteOffset, iv.byteLength);
+          const lastWord = dv.getUint32(iv.byteLength - 4, false);
+          dv.setUint32(iv.byteLength - 4, (lastWord + index) >>> 0, false);
+          return iv;
+        }
+
+        function chunkAdditionalData(index) {
+          const buf = new ArrayBuffer(4);
+          new DataView(buf).setUint32(0, index, false);
+          return new Uint8Array(buf);
         }
 
         // ── Server mode (home): read clipboard, chunk ciphertext, send header+sig ──

@@ -280,3 +280,61 @@ def test_finish_drive_happy_path(monkeypatch, tmp_path):
     assert js["name"] == "secret.bin"
     assert called["hit"] is True
 
+
+def test_chunked_decrypt_encv3(tmp_path):
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_private_pem = rsa_key.private_bytes(
+        Encoding.PEM,
+        PrivateFormat.TraditionalOpenSSL,
+        NoEncryption(),
+    )
+    rsa_private_file = tmp_path / "rsa_private.pem"
+    rsa_private_file.write_bytes(rsa_private_pem)
+
+    server.PRIVATE_KEY_FILE = str(rsa_private_file)
+    server._RSA_PRIVATE = None
+
+    iv_base = os.urandom(12)
+    chunk_size = 5
+    plaintext = b"chunked plaintext payload"
+    aes_key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(aes_key)
+
+    wrapped_key = rsa_key.public_key().encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+
+    cipher_chunks = []
+    for idx in range(0, len(plaintext), chunk_size):
+        chunk = plaintext[idx : idx + chunk_size]
+        iv = bytearray(iv_base)
+        base_counter = int.from_bytes(iv[-4:], "big") + idx // chunk_size
+        iv[-4:] = base_counter.to_bytes(4, "big")
+        cipher_chunks.append(
+            aesgcm.encrypt(bytes(iv), chunk, (idx // chunk_size).to_bytes(4, "big"))
+        )
+
+    cipher = b"".join(cipher_chunks)
+    header = {
+        "v": 3,
+        "alg": "AES-256-GCM",
+        "wrap": "RSA-OAEP-SHA256",
+        "filename": "chunked.bin",
+        "mime": "application/octet-stream",
+        "iv": base64.b64encode(iv_base).decode("ascii"),
+        "iv_base": base64.b64encode(iv_base).decode("ascii"),
+        "chunk_size": chunk_size,
+        "chunk_count": len(cipher_chunks),
+        "last_chunk_bytes": len(plaintext) % chunk_size or chunk_size,
+        "wrapped_key": base64.b64encode(wrapped_key).decode("ascii"),
+    }
+
+    plain, name = server._decrypt_encv3(header, cipher)
+    assert plain == plaintext
+    assert name == "chunked.bin"
+
