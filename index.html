@@ -364,27 +364,36 @@
               return;
             }
 
+            console.log("[b64drive] Raw payload bytes:", raw.length);
             const env = parseEnvelope(raw);
+            console.log("[b64drive] Envelope parsed:", {
+              encrypted: env.encrypted,
+              name: env.name,
+              mime: env.mime,
+              cipherBytes: env.cipherB64?.length || 0,
+            });
             const name = env.name || getDesiredFilename();
-          showProgress(0);
+            const mime = env.mime || "application/octet-stream";
+            showProgress(0);
 
             const transferId = await chunkedSend(env.cipherB64, (p) => {
-            showProgress(p);
-            setStatus(`Decoding ${(p * 100).toFixed(1)}% (${name})…`);
-          });
+              showProgress(p);
+              setStatus(`Decoding ${(p * 100).toFixed(1)}% (${name})…`);
+            });
+            console.log("[b64drive] chunkedSend complete:", transferId);
 
-          let res;
-          try {
-              res = await finishRemote(transferId, name, env);
-          } catch (e) {
-            if (!String(e.message || e).includes("not_authed")) throw e;
-            await ensureAuthorized();
-            res = await finishRemote(transferId, name, event);
-          }
-          hideProgress();
-          setStatus(
-            `✅ Decoded "${res?.name || name}" (id ${res?.id || "pending"}).`
-          );
+            let res;
+            try {
+              res = await finishRemote(transferId, name, mime, env);
+            } catch (e) {
+              if (!String(e.message || e).includes("not_authed")) throw e;
+              await ensureAuthorized();
+              res = await finishRemote(transferId, name, mime, env);
+            }
+            hideProgress();
+            setStatus(
+              `✅ Decoded "${res?.name || name}" (id ${res?.id || "pending"}).`
+            );
           } catch (e) {
             console.error(e);
             const msg = e && e.message ? e.message : String(e);
@@ -483,8 +492,9 @@
             method: "POST",
             credentials: "include",
           });
-          const sjs = await start.json();
-          const transferId = sjs[TRANSFER_FIELD];
+            const sjs = await start.json();
+            const transferId = sjs[TRANSFER_FIELD];
+            console.log("[b64drive] chunk/start ok:", transferId);
 
           const CHUNK = 512 * 1024;
           const total = payloadText.length;
@@ -492,6 +502,13 @@
 
           for (let off = 0; off < total; off += CHUNK) {
             const data = payloadText.slice(off, Math.min(total, off + CHUNK));
+            console.log("[b64drive] chunk/append", {
+              seq,
+              transferId,
+              off,
+              chunkLen: data.length,
+              total,
+            });
             const resp = await fetch("/api/chunk/append", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -505,10 +522,19 @@
             if (onProgress)
               onProgress(Math.min(1, (off + data.length) / total));
           }
+          console.log("[b64drive] chunkedSend loop done, chunks sent:", seq);
           return transferId;
         }
 
-        async function finishRemote(transferId, name, env) {
+        async function finishRemote(transferId, name, mime, env) {
+          console.log("[b64drive] finishRemote payload:", {
+            transferId,
+            name,
+            mime,
+            encrypted: !!env.encrypted,
+            hasHeader: !!env.headerB64,
+            hasSig: !!env.sigB64,
+          });
           const resp = await fetch(FINISH_PATH, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -516,13 +542,14 @@
             body: JSON.stringify({
               [TRANSFER_FIELD]: transferId,
               name,
-              mime: "application/octet-stream",
+              mime,
               encrypted: !!env.encrypted,
               enc_header_b64: env.headerB64 || null,
               sig_b64: env.sigB64 || null,
             }),
           });
           const js = await resp.json().catch(() => ({}));
+          console.log("[b64drive] finishRemote response:", resp.status, js);
           if (!resp.ok || !js?.ok)
             throw new Error(js?.error || resp.statusText || "finish failed");
           return js;
@@ -546,21 +573,23 @@
           // ENCV3:<headerB64>
           // SIG:<sigB64>
           // <cipherB64>
-          const m = /^ENCV3:([^\r\n]+)\r?\nSIG:([^\r\n]+)\r?\n([\s\S]+)$/i.exec(
+          const m = /ENCV3:([^\r\n]+)\r?\nSIG:([^\r\n]+)\r?\n([\s\S]+)/i.exec(
             trimmed
           );
           if (!m) {
             // legacy fallback: optionally supports FILENAME:... and raw base64
-            const legacy = /^FILENAME:([^\r\n]+)\r?\n([\s\S]*)$/i.exec(trimmed);
+            const legacy = /FILENAME:([^\r\n]+)\r?\n([\s\S]*)/i.exec(trimmed);
             if (legacy)
               return {
                 encrypted: false,
                 name: legacy[1].trim(),
+                mime: "application/octet-stream",
                 cipherB64: normalizeB64(legacy[2]),
               };
             return {
               encrypted: false,
               name: "file.bin",
+              mime: "application/octet-stream",
               cipherB64: normalizeB64(trimmed),
             };
         }
@@ -571,16 +600,19 @@
 
           // If we can decode header, prefer embedded filename as default.
           let embeddedName = "";
+          let embeddedMime = "";
           try {
             const headerJson = JSON.parse(
               new TextDecoder().decode(b64ToBytes(headerB64))
             );
             embeddedName = headerJson?.filename || "";
+            embeddedMime = headerJson?.mime || "";
           } catch {}
 
           return {
             encrypted: true,
             name: embeddedName || "file.bin",
+            mime: embeddedMime || "application/octet-stream",
             headerB64,
             sigB64,
             cipherB64,
