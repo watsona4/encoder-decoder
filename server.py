@@ -25,6 +25,7 @@ from google.oauth2 import service_account
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8000"))
+TESTING = os.getenv("UNIT_TESTING", "false").lower() in ("1", "true", "yes")
 
 # Redis via individual env vars (no local container)
 REDIS_HOST = os.getenv("REDIS_HOST")
@@ -58,29 +59,53 @@ PRIVATE_KEY_FILE = os.getenv("PRIVATE_KEY_FILE")  # RSA private key for unwrap (
 SIGN_PUBLIC_KEY_FILE = os.getenv("SIGN_PUBLIC_KEY_FILE")  # Ed25519 public key for verify (PEM)
 
 if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-    raise SystemExit("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET")
+    if not TESTING:
+        raise SystemExit("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET")
+    GOOGLE_CLIENT_ID = GOOGLE_CLIENT_ID or "test-client"
+    GOOGLE_CLIENT_SECRET = GOOGLE_CLIENT_SECRET or "test-secret"
 
 if not REDIS_HOST:
-    raise SystemExit("Set REDIS_HOST (and optionally REDIS_PORT/DB/USERNAME/PASSWORD/SSL) to use your existing Redis.")
+    if not TESTING:
+        raise SystemExit("Set REDIS_HOST (and optionally REDIS_PORT/DB/USERNAME/PASSWORD/SSL) to use your existing Redis.")
+    REDIS_HOST = "localhost"
 
-# Build Redis client
-r = redis.Redis(
-    host=REDIS_HOST,
-    port=REDIS_PORT,
-    db=REDIS_DB,
-    username=REDIS_USERNAME,
-    password=REDIS_PASSWORD,
-    ssl=REDIS_SSL,
-    decode_responses=False,  # store tokens as bytes
-    socket_timeout=5,
-    socket_connect_timeout=5,
-)
+if TESTING:
+    class _FakeRedis:
+        def __init__(self):
+            self._store = {}
 
-# Test connection early (fail fast)
-try:
-    r.ping()
-except Exception as e:
-    raise SystemExit(f"Failed to connect to Redis at {REDIS_HOST}:{REDIS_PORT} db={REDIS_DB} ssl={REDIS_SSL}: {e}")
+        def ping(self):
+            return True
+
+        def setex(self, key, ttl, value):
+            self._store[key] = value
+
+        def get(self, key):
+            return self._store.get(key)
+
+        def delete(self, key):
+            self._store.pop(key, None)
+
+    r = _FakeRedis()
+else:
+    # Build Redis client
+    r = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        username=REDIS_USERNAME,
+        password=REDIS_PASSWORD,
+        ssl=REDIS_SSL,
+        decode_responses=False,  # store tokens as bytes
+        socket_timeout=5,
+        socket_connect_timeout=5,
+    )
+
+    # Test connection early (fail fast)
+    try:
+        r.ping()
+    except Exception as e:
+        raise SystemExit(f"Failed to connect to Redis at {REDIS_HOST}:{REDIS_PORT} db={REDIS_DB} ssl={REDIS_SSL}: {e}")
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 
@@ -409,9 +434,9 @@ def _udir(sid, uid):
     return d
 
 
-def _b64p(sid, uid):
-    path = _udir(sid, uid) / "payload.b64"
-    _debug_event("b64_path", sid=_token_preview(sid), uid=uid, path=str(path))
+def _payload_path(sid, uid):
+    path = _udir(sid, uid) / "payload.bin"
+    _debug_event("payload_path", sid=_token_preview(sid), uid=uid, path=str(path))
     return path
 
 
@@ -429,7 +454,7 @@ def chunk_start():
     dirp = _udir(sid, uid)
     try:
         _meta(sid, uid).write_bytes(json.dumps({"seq": -1}).encode())
-        _b64p(sid, uid).write_bytes(b"")
+        _payload_path(sid, uid).write_bytes(b"")
     except Exception as e:
         logger.exception("chunk_start failed: sid=%s uid=%s dir=%s", sid, uid, dirp)
         _debug_event("chunk_start_failed", sid=_token_preview(sid), uid=uid, error=str(e))
@@ -443,15 +468,29 @@ def chunk_start():
 @app.post("/api/chunk/append")
 def chunk_append():
     sid = _sid()
-    b = request.get_json(force=True)
-    _debug_event("chunk_append_body", sid=_token_preview(sid), body_keys=list(b.keys()))
-    uid = b.get("upload_id")
-    seq = int(b.get("seq", -1))
-    data = b.get("data", "")
-    logger.debug(
-        "chunk_append in: sid=%s uid=%s seq=%s data_len=%s", sid, uid, seq, len(data) if isinstance(data, str) else -1
+    raw = request.get_data(cache=False) or b""
+    try:
+        b = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        b = {}
+    uid = request.headers.get("Upload-Id") or b.get("upload_id")
+    seq = int(request.headers.get("Upload-Seq") or b.get("seq") or -1)
+    if request.mimetype and "json" in request.mimetype and b.get("data"):
+        try:
+            raw = base64.b64decode(b["data"].encode())
+        except Exception:
+            raw = b""
+    _debug_event(
+        "chunk_append_body",
+        sid=_token_preview(sid),
+        body_keys=list(b.keys()),
+        headers=dict(request.headers),
+        raw_len=len(raw),
     )
-    if not uid or seq < 0 or not data:
+    logger.debug(
+        "chunk_append in: sid=%s uid=%s seq=%s raw_len=%s", sid, uid, seq, len(raw)
+    )
+    if not uid or seq < 0 or not raw:
         logger.warning("chunk_append bad_args: sid=%s uid=%s seq=%s", sid, uid, seq)
         _debug_event("chunk_append_bad_args", sid=_token_preview(sid), uid=uid, seq=seq)
         return jsonify({"ok": False, "error": "bad_args"}), 400
@@ -467,54 +506,32 @@ def chunk_append():
         logger.warning("chunk_append out_of_order: sid=%s uid=%s expected=%s got=%s", sid, uid, exp, seq)
         _debug_event("chunk_append_out_of_order", sid=_token_preview(sid), uid=uid, expected=exp, got=seq)
         return jsonify({"ok": False, "error": f"out_of_order expected {exp} got {seq}"}), 409
-    b64p = _b64p(sid, uid)
+    payload_path = _payload_path(sid, uid)
     try:
-        with open(b64p, "ab") as f:
-            f.write(data.encode())
-            f.write(b"\n")
+        with open(payload_path, "ab") as f:
+            f.write(raw)
         meta["seq"] = seq
         m.write_bytes(json.dumps(meta).encode())
     except Exception as e:
-        logger.exception("chunk_append write_failed: sid=%s uid=%s path=%s", sid, uid, b64p)
+        logger.exception("chunk_append write_failed: sid=%s uid=%s path=%s", sid, uid, payload_path)
         return jsonify({"ok": False, "error": f"write_failed: {e}"}), 500
     _debug_event(
         "chunk_append_written",
         sid=_token_preview(sid),
         uid=uid,
         seq=seq,
-        bytes_written=len(data),
-        file_size=b64p.stat().st_size if b64p.exists() else -1,
+        bytes_written=len(raw),
+        file_size=payload_path.stat().st_size if payload_path.exists() else -1,
     )
     logger.debug(
         "chunk_append ok: sid=%s uid=%s seq=%s path=%s size_now=%s",
         sid,
         uid,
         seq,
-        b64p,
-        b64p.stat().st_size if b64p.exists() else -1,
+        payload_path,
+        payload_path.stat().st_size if payload_path.exists() else -1,
     )
     return jsonify({"ok": True, "next": seq + 1})
-
-
-def _iter_b64_file_decode(p: pathlib.Path):
-    carry = ""
-    _debug_event("iter_b64_start", path=str(p))
-    with open(p, "rt", encoding="utf-8", errors="ignore") as f:
-        for slab in f:
-            s = carry + slab.strip().replace(" ", "")
-            use = (len(s) // 4) * 4
-            if use:
-                chunk = base64.b64decode(s[:use])
-                _debug_event("iter_b64_chunk", read=len(slab), decoded=len(chunk))
-                yield chunk
-                carry = s[use:]
-            else:
-                carry = s
-    if carry:
-        pad = carry + "==="[: (4 - len(carry) % 4) % 4]
-        chunk = base64.b64decode(pad)
-        _debug_event("iter_b64_tail", decoded=len(chunk))
-        yield chunk
 
 
 @app.post("/api/chunk/finish/download")
@@ -525,7 +542,7 @@ def chunk_finish_download():
     uid = b.get("upload_id")
     name = b.get("name", "file.bin")
     mime = b.get("mime", "application/octet-stream")
-    p = _b64p(sid, uid) if uid else None
+    p = _payload_path(sid, uid) if uid else None
     logger.info(
         "finish_download in: sid=%s uid=%s name=%s mime=%s path=%s exists=%s",
         sid,
@@ -547,9 +564,13 @@ def chunk_finish_download():
 
     def g():
         try:
-            for c in _iter_b64_file_decode(p):
-                _debug_event("finish_download_stream", chunk=len(c))
-                yield c
+            with open(p, "rb") as f:
+                while True:
+                    chunk = f.read(512 * 1024)
+                    if not chunk:
+                        break
+                    _debug_event("finish_download_stream", chunk=len(chunk))
+                    yield chunk
             logger.info("finish_download decode_complete: sid=%s uid=%s", sid, uid)
         finally:
             try:
@@ -585,12 +606,10 @@ def chunk_finish_drive():
     encrypted = bool(b.get("encrypted"))
     enc_header_b64 = b.get("enc_header_b64")
     sig_b64 = b.get("sig_b64")
-    if not encrypted and enc_header_b64 and sig_b64:
-        encrypted = True
 
     name = b.get("name", "file.bin")
     mime = b.get("mime", "application/octet-stream")
-    p = _b64p(sid, uid) if uid else None
+    p = _payload_path(sid, uid) if uid else None
     logger.info(
         "finish_drive in: sid=%s uid=%s encrypted=%s name=%s mime=%s path=%s exists=%s",
         sid,
@@ -609,44 +628,33 @@ def chunk_finish_drive():
         logger.warning("finish_drive unknown_upload: sid=%s uid=%s path=%s", sid, uid, p)
         _debug_event("finish_drive_missing_file", sid=_token_preview(sid), uid=uid, path=str(p))
         return jsonify({"ok": False, "error": "unknown_upload"}), 404
+    if not encrypted:
+        _debug_event("finish_drive_requires_encrypted", sid=_token_preview(sid))
+        return jsonify({"ok": False, "error": "encryption_required"}), 400
+    if not enc_header_b64 or not sig_b64:
+        _debug_event("finish_drive_missing_enc_params", sid=_token_preview(sid))
+        return jsonify({"ok": False, "error": "missing_enc_params"}), 400
     out = _udir(sid, uid) / "payload.bin"
     try:
-        # decode stored base64 to raw bytes (ciphertext if encrypted, plaintext if not)
-        raw = bytearray()
-        for c in _iter_b64_file_decode(p):
-            raw.extend(c)
-            _debug_event("finish_drive_raw_chunk", size=len(raw))
+        raw = p.read_bytes()
+        _debug_event("finish_drive_raw_chunk", size=len(raw))
 
-        if encrypted:
-            if not enc_header_b64 or not sig_b64:
-                _debug_event("finish_drive_missing_enc_params", sid=_token_preview(sid))
-                return jsonify({"ok": False, "error": "missing_enc_params"}), 400
+        cipher_b64 = base64.b64encode(raw).decode("ascii")
+        _verify_sig_encv3(enc_header_b64, sig_b64, cipher_b64)
+        _debug_event("finish_drive_signature_verified", sid=_token_preview(sid))
 
-            # Reconstruct ciphertext base64 as signed: remove whitespace/newlines.
-            cipher_b64 = p.read_text("utf-8", errors="ignore")
-            cipher_b64 = cipher_b64.replace("\r", "").replace("\n", "").replace(" ", "")
-            _verify_sig_encv3(enc_header_b64, sig_b64, cipher_b64)
-            _debug_event("finish_drive_signature_verified", sid=_token_preview(sid))
+        header = json.loads(base64.b64decode(enc_header_b64).decode("utf-8"))
+        plain, fname = _decrypt_encv3(header, bytes(raw))
+        _debug_event("finish_drive_decrypt_ok", sid=_token_preview(sid), header_keys=list(header.keys()))
 
-            header = json.loads(base64.b64decode(enc_header_b64).decode("utf-8"))
-            plain, fname = _decrypt_encv3(header, bytes(raw))
-            _debug_event("finish_drive_decrypt_ok", sid=_token_preview(sid), header_keys=list(header.keys()))
+        name = fname or name
+        mime = header.get("mime") or mime
 
-            # Prefer embedded filename if present
-            name = fname or name
-            mime = header.get("mime") or mime
-
-            with open(out, "wb") as o:
-                o.write(plain)
-            logger.info(
-                "finish_drive verified+decrypted: sid=%s uid=%s out=%s size=%s", sid, uid, out, out.stat().st_size
-            )
-        else:
-            with open(out, "wb") as o:
-                o.write(bytes(raw))
-            logger.info("finish_drive decoded: sid=%s uid=%s out=%s size=%s", sid, uid, out, out.stat().st_size)
-            _debug_event("finish_drive_plain_saved", sid=_token_preview(sid), path=str(out), size=out.stat().st_size)
-
+        with open(out, "wb") as o:
+            o.write(plain)
+        logger.info(
+            "finish_drive verified+decrypted: sid=%s uid=%s out=%s size=%s", sid, uid, out, out.stat().st_size
+        )
     except Exception as e:
         logger.exception("finish_drive decode_or_decrypt_failed: sid=%s uid=%s", sid, uid)
         _debug_event("finish_drive_decode_failed", sid=_token_preview(sid), error=str(e))
@@ -879,12 +887,12 @@ def chunk_debug():
     if base.exists():
         for uid_dir in base.iterdir():
             if uid_dir.is_dir():
-                b64 = _b64p(sid, uid_dir.name)
+                payload = _payload_path(sid, uid_dir.name)
                 info.append({
                     "uid": uid_dir.name,
                     "meta_exists": (_meta(sid, uid_dir.name)).exists(),
-                    "b64_exists": b64.exists(),
-                    "b64_size": b64.stat().st_size if b64.exists() else 0,
+                    "payload_exists": payload.exists(),
+                    "payload_size": payload.stat().st_size if payload.exists() else 0,
                 })
     logger.info("chunk_debug: sid=%s entries=%s", sid, len(info))
     _debug_event("chunk_debug_summary", sid=_token_preview(sid), entries=len(info))
