@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+import gzip
 import re
 import secrets
 import shutil
@@ -176,7 +177,7 @@ def _decrypt_encv3(header: dict, ciphertext: bytes) -> tuple[bytes, str]:
         raise ValueError("unsupported_wrap")
     if header.get("alg") != "AES-256-GCM":
         raise ValueError("unsupported_alg")
-    iv = _b64d(header["iv"])
+
     wrapped_key = _b64d(header["wrapped_key"])
     priv = _get_rsa_private()
     aes_key = priv.decrypt(
@@ -187,8 +188,52 @@ def _decrypt_encv3(header: dict, ciphertext: bytes) -> tuple[bytes, str]:
             label=None,
         ),
     )
-    plain = AESGCM(aes_key).decrypt(iv, ciphertext, None)
-    return plain, (header.get("filename") or "file.bin")
+
+    chunk_count = int(header.get("chunk_count") or 1)
+    chunk_size = int(header.get("chunk_size") or len(ciphertext))
+    last_chunk_bytes = int(header.get("last_chunk_bytes") or chunk_size)
+    iv_base_b64 = header.get("iv_base") or header.get("iv")
+    if not iv_base_b64:
+        raise ValueError("missing_iv")
+    iv_base = _b64d(iv_base_b64)
+
+    def _maybe_decompress(data: bytes) -> bytes:
+        if header.get("compression") == "gzip":
+            try:
+                return gzip.decompress(data)
+            except Exception as exc:  # pragma: no cover - defensive
+                raise ValueError("decompression_failed") from exc
+        return data
+
+    def _derive_iv(iv_base_bytes: bytes, index: int) -> bytes:
+        iv = bytearray(iv_base_bytes)
+        view = memoryview(iv)
+        base = int.from_bytes(view[-4:], "big")
+        view[-4:] = (base + index).to_bytes(4, "big")
+        return bytes(iv)
+
+    if chunk_count <= 1:
+        iv = _b64d(header.get("iv") or header.get("iv_base"))
+        plain = AESGCM(aes_key).decrypt(iv, ciphertext, None)
+        return _maybe_decompress(plain), (header.get("filename") or "file.bin")
+
+    expected = (chunk_count - 1) * (chunk_size + 16) + last_chunk_bytes + 16
+    if len(ciphertext) != expected:
+        raise ValueError("cipher_length_mismatch")
+
+    out = bytearray()
+    offset = 0
+    for idx in range(chunk_count):
+        this_plain_len = chunk_size if idx < chunk_count - 1 else last_chunk_bytes
+        cipher_chunk = ciphertext[offset : offset + this_plain_len + 16]
+        iv = _derive_iv(iv_base, idx)
+        plain_chunk = AESGCM(aes_key).decrypt(
+            iv, cipher_chunk, idx.to_bytes(4, "big")
+        )
+        out.extend(plain_chunk)
+        offset += this_plain_len + 16
+
+    return _maybe_decompress(bytes(out)), (header.get("filename") or "file.bin")
 
 
 # ── Token helpers ─────────────────────────────────────────────────────────────

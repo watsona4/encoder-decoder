@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 import pytest
+import gzip
+
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -279,4 +281,177 @@ def test_finish_drive_happy_path(monkeypatch, tmp_path):
     assert js["ok"] is True
     assert js["name"] == "secret.bin"
     assert called["hit"] is True
+
+
+def test_chunked_decrypt_encv3(tmp_path):
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_private_pem = rsa_key.private_bytes(
+        Encoding.PEM,
+        PrivateFormat.TraditionalOpenSSL,
+        NoEncryption(),
+    )
+    rsa_private_file = tmp_path / "rsa_private.pem"
+    rsa_private_file.write_bytes(rsa_private_pem)
+
+    server.PRIVATE_KEY_FILE = str(rsa_private_file)
+    server._RSA_PRIVATE = None
+
+    iv_base = os.urandom(12)
+    chunk_size = 5
+    plaintext = b"chunked plaintext payload"
+    aes_key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(aes_key)
+
+    wrapped_key = rsa_key.public_key().encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+
+    cipher_chunks = []
+    for idx in range(0, len(plaintext), chunk_size):
+        chunk = plaintext[idx : idx + chunk_size]
+        iv = bytearray(iv_base)
+        base_counter = int.from_bytes(iv[-4:], "big") + idx // chunk_size
+        iv[-4:] = base_counter.to_bytes(4, "big")
+        cipher_chunks.append(
+            aesgcm.encrypt(bytes(iv), chunk, (idx // chunk_size).to_bytes(4, "big"))
+        )
+
+    cipher = b"".join(cipher_chunks)
+    header = {
+        "v": 3,
+        "alg": "AES-256-GCM",
+        "wrap": "RSA-OAEP-SHA256",
+        "filename": "chunked.bin",
+        "mime": "application/octet-stream",
+        "iv": base64.b64encode(iv_base).decode("ascii"),
+        "iv_base": base64.b64encode(iv_base).decode("ascii"),
+        "chunk_size": chunk_size,
+        "chunk_count": len(cipher_chunks),
+        "last_chunk_bytes": len(plaintext) % chunk_size or chunk_size,
+        "wrapped_key": base64.b64encode(wrapped_key).decode("ascii"),
+    }
+
+    plain, name = server._decrypt_encv3(header, cipher)
+    assert plain == plaintext
+    assert name == "chunked.bin"
+
+
+def test_finish_drive_chunked_signature_with_gzip(monkeypatch, tmp_path):
+    client, sid = _client_with_cookie()
+    _store_tokens(sid)
+
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rsa_private_pem = rsa_key.private_bytes(
+        Encoding.PEM,
+        PrivateFormat.TraditionalOpenSSL,
+        NoEncryption(),
+    )
+    rsa_private_file = tmp_path / "rsa_private.pem"
+    rsa_private_file.write_bytes(rsa_private_pem)
+
+    sign_key = ed25519.Ed25519PrivateKey.generate()
+    sign_pub = sign_key.public_key().public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    )
+    sign_pub_file = tmp_path / "sign_pub.pem"
+    sign_pub_file.write_bytes(sign_pub)
+
+    server.PRIVATE_KEY_FILE = str(rsa_private_file)
+    server.SIGN_PUBLIC_KEY_FILE = str(sign_pub_file)
+    server._RSA_PRIVATE = None
+    server._SIGN_PUB = None
+
+    start = client.post("/api/chunk/start")
+    upload_id = start.get_json()["upload_id"]
+
+    original_plaintext = b"chunked message payload" * 50
+    plaintext = gzip.compress(original_plaintext)
+    chunk_size = 5  # deliberately not divisible by 3 so base64 concatenation differs
+    iv_base = os.urandom(12)
+    aes_key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(aes_key)
+
+    cipher_chunks = []
+    for idx in range(0, len(plaintext), chunk_size):
+        chunk = plaintext[idx : idx + chunk_size]
+        iv = bytearray(iv_base)
+        counter = int.from_bytes(iv[-4:], "big") + idx // chunk_size
+        iv[-4:] = counter.to_bytes(4, "big")
+        cipher_chunks.append(
+            aesgcm.encrypt(bytes(iv), chunk, (idx // chunk_size).to_bytes(4, "big"))
+        )
+
+    wrapped_key = rsa_key.public_key().encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+
+    cipher = b"".join(cipher_chunks)
+    header = {
+        "v": 3,
+        "alg": "AES-256-GCM",
+        "wrap": "RSA-OAEP-SHA256",
+        "filename": "chunked.sig.bin",
+        "mime": "application/octet-stream",
+        "iv": base64.b64encode(iv_base).decode("ascii"),
+        "iv_base": base64.b64encode(iv_base).decode("ascii"),
+        "chunk_size": chunk_size,
+        "chunk_count": len(cipher_chunks),
+        "last_chunk_bytes": len(plaintext) % chunk_size or chunk_size,
+        "compression": "gzip",
+        "original_size": len(original_plaintext),
+        "compressed_size": len(plaintext),
+        "wrapped_key": base64.b64encode(wrapped_key).decode("ascii"),
+    }
+
+    header_b64 = base64.b64encode(json.dumps(header).encode()).decode("ascii")
+    cipher_b64 = base64.b64encode(cipher).decode("ascii")
+    sig_b64 = base64.b64encode(
+        sign_key.sign(f"ENCV3:{header_b64}\n{cipher_b64}".encode())
+    ).decode("ascii")
+
+    for seq, chunk in enumerate(cipher_chunks):
+        resp = client.post(
+            "/api/chunk/append",
+            data=chunk,
+            headers={"Upload-Id": upload_id, "Upload-Seq": str(seq)},
+        )
+        assert resp.status_code == 200
+
+    called = {}
+
+    def _fake_drive_upload(sid, tok, file_path, name, mime):
+        called["hit"] = True
+        called["content"] = Path(file_path).read_bytes()
+        return True, {"id": "gid", "name": "chunked.sig.bin"}
+
+    monkeypatch.setattr(server, "_drive_upload", _fake_drive_upload)
+
+    resp = client.post(
+        "/api/chunk/finish/drive",
+        json={
+            "upload_id": upload_id,
+            "name": "ignored.bin",
+            "mime": "application/octet-stream",
+            "encrypted": True,
+            "enc_header_b64": header_b64,
+            "sig_b64": sig_b64,
+        },
+    )
+
+    assert resp.status_code == 200
+    js = resp.get_json()
+    assert js["ok"] is True
+    assert js["name"] == "chunked.sig.bin"
+    assert called["hit"] is True
+    assert called["content"] == original_plaintext
 
