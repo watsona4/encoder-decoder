@@ -165,29 +165,42 @@
 
       <progress id="progress" value="0" max="1" hidden></progress>
       <pre id="status">Pick a file to begin.</pre>
+
+      <details id="keys-panel">
+        <summary>Client key settings (stored locally)</summary>
+        <p>
+          Paste the server RSA public key and your client signing private key.
+          They are kept in your browser storage and never committed to the
+          project. You can also provide them via a local <code>keys.js</code>
+          that defines <code>window.DECODER_KEYS</code>.
+        </p>
+        <label>
+          <div>Server RSA public key (PEM)</div>
+          <textarea id="server-pub" rows="5" style="width: 100%"></textarea>
+        </label>
+        <label>
+          <div>Client Ed25519 private key (PEM)</div>
+          <textarea id="client-priv" rows="5" style="width: 100%"></textarea>
+        </label>
+        <div class="controls" style="margin-top: 12px">
+          <button type="button" id="save-keys">Save locally</button>
+          <span id="key-status" aria-live="polite"></span>
+        </div>
+      </details>
     </main>
 
-    <script>
-      (function () {
+      <script>
+        (function () {
         // ─────────────────────────────────────────────────────────────────────
-        // Keys (embed locally on each machine)
-        //
-        // Work computer (encoder): needs SERVER_RSA_PUBLIC_KEY_PEM + CLIENT_SIGN_PRIVATE_KEY_PEM
-        // Home server (decoder):  uses its own PRIVATE_KEY_FILE + SIGN_PUBLIC_KEY_FILE env vars.
-        //
-        // Generate keys (example):
-        //   # RSA-OAEP keypair (server)
-        //   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out rsa_private.pem
-        //   openssl rsa -in rsa_private.pem -pubout -out rsa_public.pem
-        //
-        //   # Ed25519 signing keypair (client)
-        //   openssl genpkey -algorithm Ed25519 -out sign_private.pem
-        //   openssl pkey -in sign_private.pem -pubout -out sign_public.pem
-        //
-        // Paste PEMs below (including BEGIN/END lines). Keep the private key only on the work PC.
+        // Keys are supplied via keys.js (ignored by git). Copy keys.example.js
+        // to keys.js and paste your PEM blocks there to avoid committing
+        // secrets. Both keys are required to encode and decode payloads.
         // ─────────────────────────────────────────────────────────────────────
-        const SERVER_RSA_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAqIcrrG7V7mmaeCdkeZmG8kbhR6eh6TG8HfS+tfQxYe39bDIHa/xyjWVzKMp2Uy1TD7UCKhNz4DsKdLzLKdWcuJVGhcMtNlmIJzBYaQFBlhJJRG1OgliTdrKLIY5tvoVlRId34k01bQIQ/J1IEC5CQYcMLgvhgbO8gR2K87jpvOrM6KuMDEcGlxGznVB/Bif9wX6N+fYhwmBgW7gYoYYpEf7j1m1QJ/BhuKwdWJK1BvziZzT76UALviKS7WrRBSgobpbSCh8GLpTsmAXILxJaivDV1/wddY9U3x92vjuDekwMiOD11GPxbxKCBXk+3FjffxQ2d6DdgjxUiY4aXbHTffnl7h4owKQeSVoCtUHrgTvr3wwrKHHcgYpGC0T+TOanqu/6JuodPOgmFVPyyI+pt2KjE6mg5x0r7jPxE/yjFvfb3nMfuYpH6EDj+EgBC/eWE2iigwtgdAA29Ez+G98OL9IYDvxf/36yuhvzOxNMEMKMo9zMbcky1gsKWYUdx3U1Jd/Kl0NHkKz0WwDnncyD+G0id++g22ENWhCzcQ0uHd1E7yW27OfpM/MmmHxW6rIblsj3CXSMkoMLSaRigxAipSaIntB9VuHbeLvxlT6cSKjj/nzmRWv2ImpWRL/cMyRwqIUtX9F0bw+qwhVaK47niuXqJYtN45CYE1wIcM0rT2UCAwEAAQ==\n-----END PUBLIC KEY-----`;
-        const CLIENT_SIGN_PRIVATE_KEY_PEM = `-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINxWYcOrUrGsd3jErBASBjXn9Tmpa+e0i13bV5+lEX2D\n-----END PRIVATE KEY-----`;
+        const keyPanel = document.getElementById("keys-panel");
+        const serverKeyInput = document.getElementById("server-pub");
+        const clientKeyInput = document.getElementById("client-priv");
+        const saveKeysBtn = document.getElementById("save-keys");
+        const keyStatus = document.getElementById("key-status");
 
         const clientPicker = document.getElementById("client-picker");
         const fileInput = document.getElementById("file");
@@ -213,6 +226,9 @@
         ].join("");
         const FINISH_PATH =
           "/api/chunk/finish/" + ["d", "r", "i", "v", "e"].join("");
+        const CHUNK_SIZE = 512 * 1024;
+        const webcrypto = ensureCrypto();
+        const keyStorage = createKeyStorage();
 
         const state = {
           serverAvailable: false,
@@ -221,6 +237,7 @@
           mode: "client",
         };
 
+        hydrateKeyInputs();
         refreshUI();
         detectServer();
         window.addEventListener("focus", detectServer);
@@ -239,6 +256,14 @@
         submitMarkdownBtn.addEventListener("click", async () => {
           if (state.busy || state.mode !== "server") return;
           await submitMarkdown();
+        });
+
+        saveKeysBtn.addEventListener("click", () => {
+          const server = serverKeyInput.value.trim();
+          const client = clientKeyInput.value.trim();
+          keyStorage.save(server, client);
+          keyStatus.textContent = "Saved locally.";
+          setTimeout(() => (keyStatus.textContent = ""), 3000);
         });
 
         async function detectServer() {
@@ -281,46 +306,79 @@
         }
 
         async function encryptAndSign(file) {
-          if (
-            !SERVER_RSA_PUBLIC_KEY_PEM.includes("BEGIN PUBLIC KEY") ||
-            SERVER_RSA_PUBLIC_KEY_PEM.includes("PASTE_RSA_PUBLIC_KEY")
-          ) {
-            throw new Error("Missing SERVER_RSA_PUBLIC_KEY_PEM.");
-          }
-          if (
-            !CLIENT_SIGN_PRIVATE_KEY_PEM.includes("BEGIN PRIVATE KEY") ||
-            CLIENT_SIGN_PRIVATE_KEY_PEM.includes("PASTE_ED25519_PRIVATE_KEY")
-          ) {
-            throw new Error("Missing CLIENT_SIGN_PRIVATE_KEY_PEM.");
-          }
+          const keys = await loadKeys();
 
-          const rsaPub = await importRsaOaepPublicKey(
-            SERVER_RSA_PUBLIC_KEY_PEM
-          );
-          const signPriv = await importEd25519PrivateKey(
-            CLIENT_SIGN_PRIVATE_KEY_PEM
-          );
+          const rsaPub = await importRsaOaepPublicKey(keys.server);
+          const signPriv = await importEd25519PrivateKey(keys.client);
 
-          const iv = crypto.getRandomValues(new Uint8Array(12));
-          const aesKey = await crypto.subtle.generateKey(
+          const ivBase = webcrypto.getRandomValues(new Uint8Array(12));
+          const aesKey = await webcrypto.subtle.generateKey(
             { name: "AES-GCM", length: 256 },
             true,
             ["encrypt", "decrypt"]
           );
           const aesRaw = new Uint8Array(
-            await crypto.subtle.exportKey("raw", aesKey)
+            await webcrypto.subtle.exportKey("raw", aesKey)
           );
           const wrappedKey = new Uint8Array(
-            await crypto.subtle.encrypt({ name: "RSA-OAEP" }, rsaPub, aesRaw)
+            await webcrypto.subtle.encrypt(
+              { name: "RSA-OAEP", hash: "SHA-256" },
+              rsaPub,
+              aesRaw
+            )
           );
 
-          const plain = new Uint8Array(await file.arrayBuffer());
-          const cipherBuf = await crypto.subtle.encrypt(
-            { name: "AES-GCM", iv },
-            aesKey,
-            plain
-          );
-          const cipher = new Uint8Array(cipherBuf);
+          const compressed = await createGzipStream(file);
+          const reader = compressed.getReader();
+          const cipherChunks = [];
+          let pending = new Uint8Array(0);
+          let idx = 0;
+          let lastChunkBytes = 0;
+          let compressedBytes = 0;
+
+          async function pushEncryptedChunk(plainChunk) {
+            lastChunkBytes = plainChunk.byteLength;
+            const iv = deriveChunkIv(ivBase, idx);
+            const cipherChunk = new Uint8Array(
+              await webcrypto.subtle.encrypt(
+                {
+                  name: "AES-GCM",
+                  iv,
+                  additionalData: chunkAdditionalData(idx),
+                },
+                aesKey,
+                plainChunk
+              )
+            );
+            cipherChunks.push(cipherChunk);
+            idx++;
+          }
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (value && value.byteLength) {
+              const incoming = new Uint8Array(value);
+              compressedBytes += incoming.byteLength;
+              pending = pending.byteLength
+                ? concatBytes(pending, incoming)
+                : incoming;
+              while (pending.byteLength >= CHUNK_SIZE) {
+                const chunk = pending.slice(0, CHUNK_SIZE);
+                pending = pending.slice(CHUNK_SIZE);
+                await pushEncryptedChunk(chunk);
+              }
+            }
+            if (done) {
+              if (pending.byteLength) {
+                await pushEncryptedChunk(pending);
+              } else if (!cipherChunks.length) {
+                await pushEncryptedChunk(new Uint8Array(0));
+              }
+              break;
+            }
+          }
+
+          const chunkCount = idx || 1;
 
           const header = {
             v: 3,
@@ -328,24 +386,64 @@
             wrap: "RSA-OAEP-SHA256",
             filename: file.name,
             mime: file.type || "application/octet-stream",
-            iv: bytesToB64(iv),
+            iv: bytesToB64(ivBase),
+            iv_base: bytesToB64(ivBase),
+            chunk_size: CHUNK_SIZE,
+            chunk_count: chunkCount,
+            last_chunk_bytes: lastChunkBytes,
+            compression: "gzip",
+            original_size: file.size,
+            compressed_size: compressedBytes,
             wrapped_key: bytesToB64(wrappedKey),
           };
 
           const headerB64 = bytesToB64(
             new TextEncoder().encode(JSON.stringify(header))
           );
+          const cipher = joinChunks(cipherChunks);
           const cipherB64 = bytesToB64(cipher);
 
           const msg = new TextEncoder().encode(
             `ENCV3:${headerB64}\n${cipherB64}`
           );
           const sig = new Uint8Array(
-            await crypto.subtle.sign({ name: "Ed25519" }, signPriv, msg)
+            await webcrypto.subtle.sign({ name: "Ed25519" }, signPriv, msg)
           );
           const sigB64 = bytesToB64(sig);
 
           return { headerB64, sigB64, cipherB64 };
+        }
+
+        function deriveChunkIv(ivBase, index) {
+          const iv = new Uint8Array(ivBase);
+          const dv = new DataView(iv.buffer, iv.byteOffset, iv.byteLength);
+          const lastWord = dv.getUint32(iv.byteLength - 4, false);
+          dv.setUint32(iv.byteLength - 4, (lastWord + index) >>> 0, false);
+          return iv;
+        }
+
+        function concatBytes(a, b) {
+          const out = new Uint8Array(a.byteLength + b.byteLength);
+          out.set(a, 0);
+          out.set(b, a.byteLength);
+          return out;
+        }
+
+        function chunkAdditionalData(index) {
+          const buf = new ArrayBuffer(4);
+          new DataView(buf).setUint32(0, index, false);
+          return new Uint8Array(buf);
+        }
+
+        function joinChunks(chunks) {
+          const total = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+          const out = new Uint8Array(total);
+          let offset = 0;
+          for (const chunk of chunks) {
+            out.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
+          return out;
         }
 
         // ── Server mode (home): read clipboard, chunk ciphertext, send header+sig ──
@@ -370,13 +468,15 @@
               encrypted: env.encrypted,
               name: env.name,
               mime: env.mime,
-              cipherBytes: env.cipherB64?.length || 0,
+              cipherBytes: env.cipherBytes?.byteLength || 0,
             });
             const name = env.name || getDesiredFilename();
             const mime = env.mime || "application/octet-stream";
-            showProgress(0);
+            const totalBytes = env.cipherBytes?.byteLength || 0;
+            announceChunkPlan(totalBytes, name);
+            await waitForPaint();
 
-            const transferId = await chunkedSend(env.cipherB64, (p) => {
+            const transferId = await chunkedSend(env.cipherBytes, (p) => {
               showProgress(p);
               setStatus(`Decoding ${(p * 100).toFixed(1)}% (${name})…`);
             });
@@ -487,7 +587,7 @@
           return ph || "document.docx";
         }
 
-        async function chunkedSend(payloadText, onProgress) {
+        async function chunkedSend(payloadBytes, onProgress) {
           const start = await fetch("/api/chunk/start", {
             method: "POST",
             credentials: "include",
@@ -496,24 +596,30 @@
             const transferId = sjs[TRANSFER_FIELD];
             console.log("[b64drive] chunk/start ok:", transferId);
 
-          const CHUNK = 512 * 1024;
-          const total = payloadText.length;
+          const total = payloadBytes.byteLength;
           let seq = 0;
 
-          for (let off = 0; off < total; off += CHUNK) {
-            const data = payloadText.slice(off, Math.min(total, off + CHUNK));
+          for (let off = 0; off < total; off += CHUNK_SIZE) {
+            const data = payloadBytes.slice(
+              off,
+              Math.min(total, off + CHUNK_SIZE)
+            );
             console.log("[b64drive] chunk/append", {
               seq,
               transferId,
               off,
-              chunkLen: data.length,
+              chunkLen: data.byteLength,
               total,
             });
             const resp = await fetch("/api/chunk/append", {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "Upload-Id": transferId,
+                "Upload-Seq": String(seq),
+              },
               credentials: "include",
-              body: JSON.stringify({ [TRANSFER_FIELD]: transferId, seq, data }),
+              body: data,
             });
             const js = await resp.json();
             if (!resp.ok || !js?.ok)
@@ -576,23 +682,7 @@
           const m = /ENCV3:([^\r\n]+)\r?\nSIG:([^\r\n]+)\r?\n([\s\S]+)/i.exec(
             trimmed
           );
-          if (!m) {
-            // legacy fallback: optionally supports FILENAME:... and raw base64
-            const legacy = /FILENAME:([^\r\n]+)\r?\n([\s\S]*)/i.exec(trimmed);
-            if (legacy)
-              return {
-                encrypted: false,
-                name: legacy[1].trim(),
-                mime: "application/octet-stream",
-                cipherB64: normalizeB64(legacy[2]),
-              };
-            return {
-              encrypted: false,
-              name: "file.bin",
-              mime: "application/octet-stream",
-              cipherB64: normalizeB64(trimmed),
-            };
-        }
+          if (!m) throw new Error("Invalid payload: expected ENCV3 envelope.");
 
           const headerB64 = m[1].trim();
           const sigB64 = m[2].trim();
@@ -615,7 +705,7 @@
             mime: embeddedMime || "application/octet-stream",
             headerB64,
             sigB64,
-            cipherB64,
+            cipherBytes: b64ToBytes(cipherB64),
           };
         }
 
@@ -687,6 +777,78 @@
           throw new Error("authorization_timeout");
         }
 
+        async function loadKeys() {
+          await maybeLoadExternalKeys();
+          const embedded = readEmbeddedKeys();
+          const saved = keyStorage.load();
+          const fallback = {
+            server: serverKeyInput.value.trim(),
+            client: clientKeyInput.value.trim(),
+          };
+
+          const server = embedded.server || saved.server || fallback.server;
+          const client = embedded.client || saved.client || fallback.client;
+
+          if (!server || !client) {
+            keyPanel.open = true;
+            throw new Error(
+              "Missing keys. Paste the server public key and client private key in the key settings panel."
+            );
+          }
+
+          serverKeyInput.value = server;
+          clientKeyInput.value = client;
+          return { server, client };
+        }
+
+        async function maybeLoadExternalKeys() {
+          if (window.DECODER_KEYS || window.__DECODER_KEYS_ATTEMPTED) return;
+          window.__DECODER_KEYS_ATTEMPTED = true;
+          try {
+            await import("./keys.js");
+          } catch (e) {
+            console.info("keys.js not found; relying on saved/pasted keys", e);
+          }
+        }
+
+        function hydrateKeyInputs() {
+          const embedded = readEmbeddedKeys();
+          const saved = keyStorage.load();
+          serverKeyInput.value = saved.server || embedded.server || "";
+          clientKeyInput.value = saved.client || embedded.client || "";
+        }
+
+        function readEmbeddedKeys() {
+          const source = window.DECODER_KEYS || {};
+          return {
+            server: (source.SERVER_RSA_PUBLIC_KEY_PEM || "").trim(),
+            client: (source.CLIENT_SIGN_PRIVATE_KEY_PEM || "").trim(),
+          };
+        }
+
+        function createKeyStorage() {
+          const SERVER_KEY = "decoder_server_pub";
+          const CLIENT_KEY = "decoder_client_priv";
+          return {
+            save(server, client) {
+              try {
+                if (server) localStorage.setItem(SERVER_KEY, server);
+                if (client) localStorage.setItem(CLIENT_KEY, client);
+              } catch {}
+            },
+            load() {
+              try {
+                return {
+                  server: localStorage.getItem(SERVER_KEY) || "",
+                  client: localStorage.getItem(CLIENT_KEY) || "",
+                };
+              } catch {
+                return { server: "", client: "" };
+              }
+            },
+          };
+        }
+
         function getDesiredFilename() {
           const raw = filenameInput.value.trim();
           if (raw) return raw;
@@ -714,7 +876,7 @@
         // ── Key import helpers (WebCrypto) ─────────────────────────────────────
         async function importRsaOaepPublicKey(pem) {
           const der = pemToDer(pem);
-          return crypto.subtle.importKey(
+          return webcrypto.subtle.importKey(
             "spki",
             der,
             { name: "RSA-OAEP", hash: "SHA-256" },
@@ -725,13 +887,35 @@
 
         async function importEd25519PrivateKey(pem) {
           const der = pemToDer(pem);
-          return crypto.subtle.importKey(
+          return webcrypto.subtle.importKey(
             "pkcs8",
             der,
             { name: "Ed25519" },
             false,
             ["sign"]
           );
+        }
+
+        function ensureCrypto() {
+          const api = globalThis.crypto || globalThis.msCrypto;
+          const hasSubtle = !!api?.subtle;
+          const hasRandom = typeof api?.getRandomValues === "function";
+          if (!hasSubtle || !hasRandom) {
+            throw new Error(
+              "Secure WebCrypto unavailable; use a modern browser over HTTPS."
+            );
+          }
+          return api;
+        }
+
+        async function createGzipStream(file) {
+          if (typeof CompressionStream === "undefined") {
+            throw new Error(
+              "CompressionStream API unavailable; try a modern Chromium- or Firefox-based browser."
+            );
+          }
+          const compressor = new CompressionStream("gzip");
+          return file.stream().pipeThrough(compressor);
         }
 
         function pemToDer(pem) {
@@ -779,6 +963,27 @@
 
         function setStatus(msg) {
           statusEl.textContent = msg;
+        }
+
+        function announceChunkPlan(totalBytes, name) {
+          const chunkCount = Math.max(1, Math.ceil(totalBytes / CHUNK_SIZE));
+          const etaSeconds = estimateDurationSeconds(chunkCount);
+          const formattedEta =
+            etaSeconds >= 90
+              ? `${Math.round(etaSeconds / 60)}m`
+              : `${etaSeconds}s`;
+          const heading = `Preparing to decode ${name} (${formatBytes(
+            totalBytes
+          )}).`;
+          const chunkLine = `Chunks: ${chunkCount} × ${formatBytes(
+            CHUNK_SIZE
+          )}.`;
+          const etaLine =
+            "Estimated time: ~" +
+            `${formattedEta} (info shown before uploads start).`;
+          setStatus([heading, chunkLine, etaLine].join("\n"));
+          showProgress(0);
+          return { chunkCount, etaSeconds };
         }
 
         function setBusy(busy) {
@@ -836,6 +1041,18 @@
 
         function sleep(ms) {
           return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        function waitForPaint() {
+          return new Promise((resolve) => {
+            const fn = typeof requestAnimationFrame === "function" ? requestAnimationFrame : setTimeout;
+            fn(() => resolve(), 16);
+          });
+        }
+
+        function estimateDurationSeconds(chunks) {
+          const assumedChunksPerSecond = 3; // conservative to remain visible on slow clients
+          return Math.max(1, Math.ceil(chunks / assumedChunksPerSecond));
         }
       })();
     </script>
