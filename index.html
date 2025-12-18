@@ -382,8 +382,8 @@
           const headerB64 = bytesToB64(
             new TextEncoder().encode(JSON.stringify(header))
           );
-          const cipherBytes = joinChunks(cipherChunks);
-          const cipherB64 = bytesToB64(cipherBytes);
+          const cipher = joinChunks(cipherChunks);
+          const cipherB64 = bytesToB64(cipher);
 
           const msg = new TextEncoder().encode(
             `ENCV3:${headerB64}\n${cipherB64}`
