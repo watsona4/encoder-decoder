@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+import gzip
 import re
 import secrets
 import shutil
@@ -196,6 +197,14 @@ def _decrypt_encv3(header: dict, ciphertext: bytes) -> tuple[bytes, str]:
         raise ValueError("missing_iv")
     iv_base = _b64d(iv_base_b64)
 
+    def _maybe_decompress(data: bytes) -> bytes:
+        if header.get("compression") == "gzip":
+            try:
+                return gzip.decompress(data)
+            except Exception as exc:  # pragma: no cover - defensive
+                raise ValueError("decompression_failed") from exc
+        return data
+
     def _derive_iv(iv_base_bytes: bytes, index: int) -> bytes:
         iv = bytearray(iv_base_bytes)
         view = memoryview(iv)
@@ -206,7 +215,7 @@ def _decrypt_encv3(header: dict, ciphertext: bytes) -> tuple[bytes, str]:
     if chunk_count <= 1:
         iv = _b64d(header.get("iv") or header.get("iv_base"))
         plain = AESGCM(aes_key).decrypt(iv, ciphertext, None)
-        return plain, (header.get("filename") or "file.bin")
+        return _maybe_decompress(plain), (header.get("filename") or "file.bin")
 
     expected = (chunk_count - 1) * (chunk_size + 16) + last_chunk_bytes + 16
     if len(ciphertext) != expected:
@@ -224,7 +233,7 @@ def _decrypt_encv3(header: dict, ciphertext: bytes) -> tuple[bytes, str]:
         out.extend(plain_chunk)
         offset += this_plain_len + 16
 
-    return bytes(out), (header.get("filename") or "file.bin")
+    return _maybe_decompress(bytes(out)), (header.get("filename") or "file.bin")
 
 
 # ── Token helpers ─────────────────────────────────────────────────────────────

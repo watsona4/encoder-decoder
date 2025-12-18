@@ -310,14 +310,15 @@
             )
           );
 
-          const reader = file.stream().getReader();
+          const compressed = await createGzipStream(file);
+          const reader = compressed.getReader();
           const cipherChunks = [];
+          let pending = new Uint8Array(0);
           let idx = 0;
           let lastChunkBytes = 0;
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            const plainChunk = new Uint8Array(value);
+          let compressedBytes = 0;
+
+          async function pushEncryptedChunk(plainChunk) {
             lastChunkBytes = plainChunk.byteLength;
             const iv = deriveChunkIv(ivBase, idx);
             const cipherChunk = new Uint8Array(
@@ -335,23 +336,31 @@
             idx++;
           }
 
-          const chunkCount = idx || 1;
-          if (!cipherChunks.length) {
-            cipherChunks.push(
-              new Uint8Array(
-                await webcrypto.subtle.encrypt(
-                  {
-                    name: "AES-GCM",
-                    iv: deriveChunkIv(ivBase, 0),
-                    additionalData: chunkAdditionalData(0),
-                  },
-                  aesKey,
-                  new Uint8Array()
-                )
-              )
-            );
-            lastChunkBytes = 0;
+          while (true) {
+            const { value, done } = await reader.read();
+            if (value && value.byteLength) {
+              const incoming = new Uint8Array(value);
+              compressedBytes += incoming.byteLength;
+              pending = pending.byteLength
+                ? concatBytes(pending, incoming)
+                : incoming;
+              while (pending.byteLength >= CHUNK_SIZE) {
+                const chunk = pending.slice(0, CHUNK_SIZE);
+                pending = pending.slice(CHUNK_SIZE);
+                await pushEncryptedChunk(chunk);
+              }
+            }
+            if (done) {
+              if (pending.byteLength) {
+                await pushEncryptedChunk(pending);
+              } else if (!cipherChunks.length) {
+                await pushEncryptedChunk(new Uint8Array(0));
+              }
+              break;
+            }
           }
+
+          const chunkCount = idx || 1;
 
           const header = {
             v: 3,
@@ -364,6 +373,9 @@
             chunk_size: CHUNK_SIZE,
             chunk_count: chunkCount,
             last_chunk_bytes: lastChunkBytes,
+            compression: "gzip",
+            original_size: file.size,
+            compressed_size: compressedBytes,
             wrapped_key: bytesToB64(wrappedKey),
           };
 
@@ -390,6 +402,13 @@
           const lastWord = dv.getUint32(iv.byteLength - 4, false);
           dv.setUint32(iv.byteLength - 4, (lastWord + index) >>> 0, false);
           return iv;
+        }
+
+        function concatBytes(a, b) {
+          const out = new Uint8Array(a.byteLength + b.byteLength);
+          out.set(a, 0);
+          out.set(b, a.byteLength);
+          return out;
         }
 
         function chunkAdditionalData(index) {
@@ -797,6 +816,16 @@
             );
           }
           return api;
+        }
+
+        async function createGzipStream(file) {
+          if (typeof CompressionStream === "undefined") {
+            throw new Error(
+              "CompressionStream API unavailable; try a modern Chromium- or Firefox-based browser."
+            );
+          }
+          const compressor = new CompressionStream("gzip");
+          return file.stream().pipeThrough(compressor);
         }
 
         function pemToDer(pem) {

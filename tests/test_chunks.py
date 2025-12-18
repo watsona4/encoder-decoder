@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 import pytest
+import gzip
+
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -339,7 +341,7 @@ def test_chunked_decrypt_encv3(tmp_path):
     assert name == "chunked.bin"
 
 
-def test_finish_drive_chunked_signature(monkeypatch, tmp_path):
+def test_finish_drive_chunked_signature_with_gzip(monkeypatch, tmp_path):
     client, sid = _client_with_cookie()
     _store_tokens(sid)
 
@@ -367,7 +369,8 @@ def test_finish_drive_chunked_signature(monkeypatch, tmp_path):
     start = client.post("/api/chunk/start")
     upload_id = start.get_json()["upload_id"]
 
-    plaintext = b"chunked message payload"
+    original_plaintext = b"chunked message payload" * 50
+    plaintext = gzip.compress(original_plaintext)
     chunk_size = 5  # deliberately not divisible by 3 so base64 concatenation differs
     iv_base = os.urandom(12)
     aes_key = AESGCM.generate_key(bit_length=256)
@@ -404,6 +407,9 @@ def test_finish_drive_chunked_signature(monkeypatch, tmp_path):
         "chunk_size": chunk_size,
         "chunk_count": len(cipher_chunks),
         "last_chunk_bytes": len(plaintext) % chunk_size or chunk_size,
+        "compression": "gzip",
+        "original_size": len(original_plaintext),
+        "compressed_size": len(plaintext),
         "wrapped_key": base64.b64encode(wrapped_key).decode("ascii"),
     }
 
@@ -423,8 +429,9 @@ def test_finish_drive_chunked_signature(monkeypatch, tmp_path):
 
     called = {}
 
-    def _fake_drive_upload(*args, **kwargs):
+    def _fake_drive_upload(sid, tok, file_path, name, mime):
         called["hit"] = True
+        called["content"] = Path(file_path).read_bytes()
         return True, {"id": "gid", "name": "chunked.sig.bin"}
 
     monkeypatch.setattr(server, "_drive_upload", _fake_drive_upload)
@@ -446,4 +453,5 @@ def test_finish_drive_chunked_signature(monkeypatch, tmp_path):
     assert js["ok"] is True
     assert js["name"] == "chunked.sig.bin"
     assert called["hit"] is True
+    assert called["content"] == original_plaintext
 
