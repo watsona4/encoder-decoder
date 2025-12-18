@@ -204,6 +204,7 @@
         const FINISH_PATH =
           "/api/chunk/finish/" + ["d", "r", "i", "v", "e"].join("");
         const CHUNK_SIZE = 512 * 1024;
+        const webcrypto = ensureCrypto();
 
         const state = {
           serverAvailable: false,
@@ -292,17 +293,17 @@
             CLIENT_SIGN_PRIVATE_KEY_PEM
           );
 
-          const ivBase = crypto.getRandomValues(new Uint8Array(12));
-          const aesKey = await crypto.subtle.generateKey(
+          const ivBase = webcrypto.getRandomValues(new Uint8Array(12));
+          const aesKey = await webcrypto.subtle.generateKey(
             { name: "AES-GCM", length: 256 },
             true,
             ["encrypt", "decrypt"]
           );
           const aesRaw = new Uint8Array(
-            await crypto.subtle.exportKey("raw", aesKey)
+            await webcrypto.subtle.exportKey("raw", aesKey)
           );
           const wrappedKey = new Uint8Array(
-            await crypto.subtle.encrypt(
+            await webcrypto.subtle.encrypt(
               { name: "RSA-OAEP", hash: "SHA-256" },
               rsaPub,
               aesRaw
@@ -320,7 +321,7 @@
             lastChunkBytes = plainChunk.byteLength;
             const iv = deriveChunkIv(ivBase, idx);
             const cipherChunk = new Uint8Array(
-              await crypto.subtle.encrypt(
+              await webcrypto.subtle.encrypt(
                 {
                   name: "AES-GCM",
                   iv,
@@ -338,7 +339,7 @@
           if (!cipherChunks.length) {
             cipherChunks.push(
               new Uint8Array(
-                await crypto.subtle.encrypt(
+                await webcrypto.subtle.encrypt(
                   {
                     name: "AES-GCM",
                     iv: deriveChunkIv(ivBase, 0),
@@ -376,7 +377,7 @@
             `ENCV3:${headerB64}\n${cipherB64}`
           );
           const sig = new Uint8Array(
-            await crypto.subtle.sign({ name: "Ed25519" }, signPriv, msg)
+            await webcrypto.subtle.sign({ name: "Ed25519" }, signPriv, msg)
           );
           const sigB64 = bytesToB64(sig);
 
@@ -766,7 +767,7 @@
         // ── Key import helpers (WebCrypto) ─────────────────────────────────────
         async function importRsaOaepPublicKey(pem) {
           const der = pemToDer(pem);
-          return crypto.subtle.importKey(
+          return webcrypto.subtle.importKey(
             "spki",
             der,
             { name: "RSA-OAEP", hash: "SHA-256" },
@@ -777,13 +778,25 @@
 
         async function importEd25519PrivateKey(pem) {
           const der = pemToDer(pem);
-          return crypto.subtle.importKey(
+          return webcrypto.subtle.importKey(
             "pkcs8",
             der,
             { name: "Ed25519" },
             false,
             ["sign"]
           );
+        }
+
+        function ensureCrypto() {
+          const api = globalThis.crypto || globalThis.msCrypto;
+          const hasSubtle = !!api?.subtle;
+          const hasRandom = typeof api?.getRandomValues === "function";
+          if (!hasSubtle || !hasRandom) {
+            throw new Error(
+              "Secure WebCrypto unavailable; use a modern browser over HTTPS."
+            );
+          }
+          return api;
         }
 
         function pemToDer(pem) {
