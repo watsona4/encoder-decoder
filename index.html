@@ -165,30 +165,9 @@
 
       <progress id="progress" value="0" max="1" hidden></progress>
       <pre id="status">Pick a file to begin.</pre>
-
-      <details id="keys-panel">
-        <summary>Client key settings (stored locally)</summary>
-        <p>
-          Paste the server RSA public key and your client signing private key.
-          They are kept in your browser storage and never committed to the
-          project. You can also provide them via a local <code>keys.js</code>
-          that defines <code>window.DECODER_KEYS</code>.
-        </p>
-        <label>
-          <div>Server RSA public key (PEM)</div>
-          <textarea id="server-pub" rows="5" style="width: 100%"></textarea>
-        </label>
-        <label>
-          <div>Client Ed25519 private key (PEM)</div>
-          <textarea id="client-priv" rows="5" style="width: 100%"></textarea>
-        </label>
-        <div class="controls" style="margin-top: 12px">
-          <button type="button" id="save-keys">Save locally</button>
-          <span id="key-status" aria-live="polite"></span>
-        </div>
-      </details>
     </main>
 
+      <script src="keys.js"></script>
       <script>
         (function () {
         // ─────────────────────────────────────────────────────────────────────
@@ -196,11 +175,9 @@
         // to keys.js and paste your PEM blocks there to avoid committing
         // secrets. Both keys are required to encode and decode payloads.
         // ─────────────────────────────────────────────────────────────────────
-        const keyPanel = document.getElementById("keys-panel");
-        const serverKeyInput = document.getElementById("server-pub");
-        const clientKeyInput = document.getElementById("client-priv");
-        const saveKeysBtn = document.getElementById("save-keys");
-        const keyStatus = document.getElementById("key-status");
+        const keySource = window.DECODER_KEYS || {};
+        const SERVER_RSA_PUBLIC_KEY_PEM = keySource.SERVER_RSA_PUBLIC_KEY_PEM || "";
+        const CLIENT_SIGN_PRIVATE_KEY_PEM = keySource.CLIENT_SIGN_PRIVATE_KEY_PEM || "";
 
         const clientPicker = document.getElementById("client-picker");
         const fileInput = document.getElementById("file");
@@ -228,7 +205,6 @@
           "/api/chunk/finish/" + ["d", "r", "i", "v", "e"].join("");
         const CHUNK_SIZE = 512 * 1024;
         const webcrypto = ensureCrypto();
-        const keyStorage = createKeyStorage();
 
         const state = {
           serverAvailable: false,
@@ -237,7 +213,6 @@
           mode: "client",
         };
 
-        hydrateKeyInputs();
         refreshUI();
         detectServer();
         window.addEventListener("focus", detectServer);
@@ -256,14 +231,6 @@
         submitMarkdownBtn.addEventListener("click", async () => {
           if (state.busy || state.mode !== "server") return;
           await submitMarkdown();
-        });
-
-        saveKeysBtn.addEventListener("click", () => {
-          const server = serverKeyInput.value.trim();
-          const client = clientKeyInput.value.trim();
-          keyStorage.save(server, client);
-          keyStatus.textContent = "Saved locally.";
-          setTimeout(() => (keyStatus.textContent = ""), 3000);
         });
 
         async function detectServer() {
@@ -306,10 +273,25 @@
         }
 
         async function encryptAndSign(file) {
-          const keys = await loadKeys();
+          if (
+            !SERVER_RSA_PUBLIC_KEY_PEM.includes("BEGIN PUBLIC KEY") ||
+            SERVER_RSA_PUBLIC_KEY_PEM.includes("PASTE_RSA_PUBLIC_KEY")
+          ) {
+            throw new Error("Missing SERVER_RSA_PUBLIC_KEY_PEM.");
+          }
+          if (
+            !CLIENT_SIGN_PRIVATE_KEY_PEM.includes("BEGIN PRIVATE KEY") ||
+            CLIENT_SIGN_PRIVATE_KEY_PEM.includes("PASTE_ED25519_PRIVATE_KEY")
+          ) {
+            throw new Error("Missing CLIENT_SIGN_PRIVATE_KEY_PEM.");
+          }
 
-          const rsaPub = await importRsaOaepPublicKey(keys.server);
-          const signPriv = await importEd25519PrivateKey(keys.client);
+          const rsaPub = await importRsaOaepPublicKey(
+            SERVER_RSA_PUBLIC_KEY_PEM
+          );
+          const signPriv = await importEd25519PrivateKey(
+            CLIENT_SIGN_PRIVATE_KEY_PEM
+          );
 
           const ivBase = webcrypto.getRandomValues(new Uint8Array(12));
           const aesKey = await webcrypto.subtle.generateKey(
@@ -775,78 +757,6 @@
             if (popup && !popup.closed) popup.close();
           } catch {}
           throw new Error("authorization_timeout");
-        }
-
-        async function loadKeys() {
-          await maybeLoadExternalKeys();
-          const embedded = readEmbeddedKeys();
-          const saved = keyStorage.load();
-          const fallback = {
-            server: serverKeyInput.value.trim(),
-            client: clientKeyInput.value.trim(),
-          };
-
-          const server = embedded.server || saved.server || fallback.server;
-          const client = embedded.client || saved.client || fallback.client;
-
-          if (!server || !client) {
-            keyPanel.open = true;
-            throw new Error(
-              "Missing keys. Paste the server public key and client private key in the key settings panel."
-            );
-          }
-
-          serverKeyInput.value = server;
-          clientKeyInput.value = client;
-          return { server, client };
-        }
-
-        async function maybeLoadExternalKeys() {
-          if (window.DECODER_KEYS || window.__DECODER_KEYS_ATTEMPTED) return;
-          window.__DECODER_KEYS_ATTEMPTED = true;
-          try {
-            await import("./keys.js");
-          } catch (e) {
-            console.info("keys.js not found; relying on saved/pasted keys", e);
-          }
-        }
-
-        function hydrateKeyInputs() {
-          const embedded = readEmbeddedKeys();
-          const saved = keyStorage.load();
-          serverKeyInput.value = saved.server || embedded.server || "";
-          clientKeyInput.value = saved.client || embedded.client || "";
-        }
-
-        function readEmbeddedKeys() {
-          const source = window.DECODER_KEYS || {};
-          return {
-            server: (source.SERVER_RSA_PUBLIC_KEY_PEM || "").trim(),
-            client: (source.CLIENT_SIGN_PRIVATE_KEY_PEM || "").trim(),
-          };
-        }
-
-        function createKeyStorage() {
-          const SERVER_KEY = "decoder_server_pub";
-          const CLIENT_KEY = "decoder_client_priv";
-          return {
-            save(server, client) {
-              try {
-                if (server) localStorage.setItem(SERVER_KEY, server);
-                if (client) localStorage.setItem(CLIENT_KEY, client);
-              } catch {}
-            },
-            load() {
-              try {
-                return {
-                  server: localStorage.getItem(SERVER_KEY) || "",
-                  client: localStorage.getItem(CLIENT_KEY) || "",
-                };
-              } catch {
-                return { server: "", client: "" };
-              }
-            },
-          };
         }
 
         function getDesiredFilename() {
