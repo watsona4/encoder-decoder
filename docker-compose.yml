@@ -1,23 +1,25 @@
 services:
   b64drive:
+    container_name: b64drive
     build: .
-    restart: unless-stopped
+    restart: always
     ports:
       - "8227:8000"
     env_file:
       - .env
     environment:
-      REDIRECT_URI: https://decode.battenkillwoodworks.com/oauth/callback
-      SA_KEY_FILE: /run/secrets/sa.json
-      PRIVATE_KEY_FILE: /run/secrets/rsa_private.pem
-      SIGN_PUBLIC_KEY_FILE: /run/secrets/sign_public.pem
-      DRIVE_SUBFOLDER_NAME: rclone
+      # Local storage path (files saved here, synced via rclone)
+      LOCAL_STORAGE_PATH: /storage
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/status"]
       interval: 10s
       timeout: 5s
       retries: 10
     volumes:
-      - ./token.json:/run/secrets/sa.json:ro
-      - ./keys/server_private.pem:/run/secrets/rsa_private.pem:ro
-      - ./keys/sign_public.pem:/run/secrets/sign_public.pem:ro
+      # Mount rclone directory for local storage (synced to Google Drive)
+      - /home/watsam/rclone:/storage
+      # Keep keys for bundle decryption
+      - keys:/app/keys:ro
+
+volumes:
+  keys:

@@ -38,8 +38,7 @@
       }
       p,
       label,
-      button,
-      input {
+      button {
         font: inherit;
       }
       .file-picker {
@@ -92,6 +91,23 @@
       button:disabled {
         opacity: 0.5;
         cursor: not-allowed;
+      }
+      .alt-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 16px;
+        padding: 8px 14px;
+        border-radius: 8px;
+        background: rgba(37, 99, 235, 0.15);
+        color: #93c5fd;
+        text-decoration: none;
+        font-size: 0.95rem;
+        border: 1px solid rgba(37, 99, 235, 0.4);
+        transition: background 0.2s;
+      }
+      .alt-link:hover {
+        background: rgba(37, 99, 235, 0.3);
       }
       #status {
         min-height: 64px;
@@ -147,14 +163,18 @@
   <body>
     <main>
       <h1>Decoder Ring</h1>
-
+      <a class="alt-link" href="index_simple.html">Clipboard bundle uploader →</a>
       <label class="file-picker" id="client-picker">
         <span id="pick-label">Select a file to start</span>
         <input type="file" id="file" />
       </label>
-
       <div class="controls">
-        <input type="text" id="filename" placeholder="document.docx" hidden />
+        <input
+          type="text"
+          id="filename"
+          placeholder="document.docx"
+          hidden
+        />
         <button type="button" id="submit-base64-btn" hidden disabled>
           Submit
         </button>
@@ -162,49 +182,25 @@
           Submit Markdown
         </button>
       </div>
-
       <progress id="progress" value="0" max="1" hidden></progress>
       <pre id="status">Pick a file to begin.</pre>
+      <button type="button" id="authorize-btn" hidden>Authorize Drive Access</button>
     </main>
 
-      <script src="keys.js"></script>
-      <script>
-        (function () {
-        // ─────────────────────────────────────────────────────────────────────
-        // Keys are supplied via keys.js (ignored by git). Copy keys.example.js
-        // to keys.js and paste your PEM blocks there to avoid committing
-        // secrets. Both keys are required to encode and decode payloads.
-        // ─────────────────────────────────────────────────────────────────────
-        const keySource = window.DECODER_KEYS || {};
-        const SERVER_RSA_PUBLIC_KEY_PEM = keySource.SERVER_RSA_PUBLIC_KEY_PEM || "";
-        const CLIENT_SIGN_PRIVATE_KEY_PEM = keySource.CLIENT_SIGN_PRIVATE_KEY_PEM || "";
-
+    <script>
+      (function () {
         const clientPicker = document.getElementById("client-picker");
         const fileInput = document.getElementById("file");
         const pickLabel = document.getElementById("pick-label");
         const statusEl = document.getElementById("status");
         const submitBase64Btn = document.getElementById("submit-base64-btn");
-        const submitMarkdownBtn = document.getElementById(
-          "submit-markdown-btn"
-        );
+        const submitMarkdownBtn = document.getElementById("submit-markdown-btn");
         const filenameInput = document.getElementById("filename");
         const progressEl = document.getElementById("progress");
+        const authorizeBtn = document.getElementById("authorize-btn");
 
-        const TRANSFER_FIELD = [
-          "u",
-          "p",
-          "l",
-          "o",
-          "a",
-          "d",
-          "_",
-          "i",
-          "d",
-        ].join("");
-        const FINISH_PATH =
-          "/api/chunk/finish/" + ["d", "r", "i", "v", "e"].join("");
-        const CHUNK_SIZE = 512 * 1024;
-
+        const TRANSFER_FIELD = "upload_id";
+        const FINISH_PATH = "/api/chunk/finish/drive";
         const state = {
           serverAvailable: false,
           authed: false,
@@ -222,6 +218,38 @@
           await handleClientSelection(file);
         });
 
+        clientPicker.addEventListener("click", (e) => {
+          if (state.busy || state.mode !== "client") return;
+          e.preventDefault();
+          e.stopPropagation();
+          setStatus("Drag and drop the file onto this box (file picker disabled).");
+        });
+
+        ["dragenter", "dragover"].forEach((ev) => {
+          clientPicker.addEventListener(ev, (e) => {
+            if (state.busy || state.mode !== "client") return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.dataTransfer.dropEffect = "copy";
+          });
+        });
+
+        clientPicker.addEventListener("drop", async (e) => {
+          if (state.busy || state.mode !== "client") return;
+          e.preventDefault();
+          e.stopPropagation();
+
+          const file = e.dataTransfer.files?.[0];
+          if (!file) return;
+
+          try {
+            await handleClientSelection(file);
+          } catch (err) {
+            console.error(err);
+            setStatus("Error: " + (err?.message || err));
+          }
+        });
+
         submitBase64Btn.addEventListener("click", async () => {
           if (state.busy || state.mode !== "server") return;
           await submitBase64();
@@ -230,6 +258,20 @@
         submitMarkdownBtn.addEventListener("click", async () => {
           if (state.busy || state.mode !== "server") return;
           await submitMarkdown();
+        });
+
+        authorizeBtn.addEventListener("click", async () => {
+          if (state.busy) return;
+          try {
+            setBusy(true);
+            await ensureAuthorized();
+          } catch (err) {
+            const msg = err?.message || "authorization_failed";
+            setStatus("Authorization error: " + msg);
+          } finally {
+            setBusy(false);
+            detectServer();
+          }
         });
 
         async function detectServer() {
@@ -249,18 +291,18 @@
           applyMode(state.serverAvailable ? "server" : "client");
         }
 
-        // ── Client (work PC): encrypt + sign, then copy to clipboard ───────────
         async function handleClientSelection(file) {
           pickLabel.textContent = `Selected: ${file.name}`;
-          setStatus(`Encrypting ${file.name} (${formatBytes(file.size)})…`);
+          setStatus(`Reading ${file.name} (${formatBytes(file.size)})…`);
           hideProgress();
           setBusy(true);
-
           try {
-            const { headerB64, sigB64, cipherB64 } = await encryptAndSign(file);
-            const envelope = `ENCV3:${headerB64}\nSIG:${sigB64}\n${cipherB64}`;
+            const payload = await toPayload(file);
+            const envelope = `FILENAME:${file.name}\n${payload}`;
             await copyText(envelope);
-            setStatus(`Decoded ${file.name} (${formatBytes(file.size)}).`);
+            setStatus(
+              `Decoded ${file.name} (${formatBytes(file.size)}).`
+            );
           } catch (e) {
             console.error(e);
             setStatus("Error: " + (e.message || e));
@@ -271,79 +313,6 @@
           }
         }
 
-        async function encryptAndSign(file) {
-          if (
-            !SERVER_RSA_PUBLIC_KEY_PEM.includes("BEGIN PUBLIC KEY") ||
-            SERVER_RSA_PUBLIC_KEY_PEM.includes("PASTE_RSA_PUBLIC_KEY")
-          ) {
-            throw new Error("Missing SERVER_RSA_PUBLIC_KEY_PEM.");
-          }
-          if (
-            !CLIENT_SIGN_PRIVATE_KEY_PEM.includes("BEGIN PRIVATE KEY") ||
-            CLIENT_SIGN_PRIVATE_KEY_PEM.includes("PASTE_ED25519_PRIVATE_KEY")
-          ) {
-            throw new Error("Missing CLIENT_SIGN_PRIVATE_KEY_PEM.");
-          }
-
-          const rsaPub = await importRsaOaepPublicKey(
-            SERVER_RSA_PUBLIC_KEY_PEM
-          );
-          const signPriv = await importEd25519PrivateKey(
-            CLIENT_SIGN_PRIVATE_KEY_PEM
-          );
-
-          const iv = crypto.getRandomValues(new Uint8Array(12));
-          const aesKey = await crypto.subtle.generateKey(
-            { name: "AES-GCM", length: 256 },
-            true,
-            ["encrypt", "decrypt"]
-          );
-          const aesRaw = new Uint8Array(
-            await crypto.subtle.exportKey("raw", aesKey)
-          );
-          const wrappedKey = new Uint8Array(
-            await crypto.subtle.encrypt(
-              { name: "RSA-OAEP", hash: "SHA-256" },
-              rsaPub,
-              aesRaw
-            )
-          );
-
-          const plain = new Uint8Array(await file.arrayBuffer());
-          const cipherBuf = await crypto.subtle.encrypt(
-            { name: "AES-GCM", iv },
-            aesKey,
-            plain
-          );
-          const cipher = new Uint8Array(cipherBuf);
-
-          const header = {
-            v: 3,
-            alg: "AES-256-GCM",
-            wrap: "RSA-OAEP-SHA256",
-            filename: file.name,
-            mime: file.type || "application/octet-stream",
-            iv: bytesToB64(iv),
-            wrapped_key: bytesToB64(wrappedKey),
-          };
-
-          const headerB64 = bytesToB64(
-            new TextEncoder().encode(JSON.stringify(header))
-          );
-          const cipherB64 = bytesToB64(cipher);
-
-          const msg = new TextEncoder().encode(
-            `ENCV3:${headerB64}\n${cipherB64}`
-          );
-          const sig = new Uint8Array(
-            await crypto.subtle.sign({ name: "Ed25519" }, signPriv, msg)
-          );
-          const sigB64 = bytesToB64(sig);
-
-          return { headerB64, sigB64, cipherB64, cipherBytes: cipher };
-        }
-
-        // ── Server mode (home): read clipboard, chunk ciphertext, send header+sig ──
         async function submitBase64() {
           if (!state.serverAvailable) {
             setStatus("Server unavailable. Try again once connected.");
@@ -358,39 +327,8 @@
               setStatus("No payload found.");
               return;
             }
-
-            console.log("[b64drive] Raw payload bytes:", raw.length);
-            const env = parseEnvelope(raw);
-            console.log("[b64drive] Envelope parsed:", {
-              encrypted: env.encrypted,
-              name: env.name,
-              mime: env.mime,
-              cipherBytes: env.cipherBytes?.byteLength || 0,
-            });
-            const name = env.name || getDesiredFilename();
-            const mime = env.mime || "application/octet-stream";
-            const totalBytes = env.cipherBytes?.byteLength || 0;
-            announceChunkPlan(totalBytes, name);
-            await waitForPaint();
-
-            const transferId = await chunkedSend(env.cipherBytes, (p) => {
-              showProgress(p);
-              setStatus(`Decoding ${(p * 100).toFixed(1)}% (${name})…`);
-            });
-            console.log("[b64drive] chunkedSend complete:", transferId);
-
-            let res;
-            try {
-              res = await finishRemote(transferId, name, mime, env);
-            } catch (e) {
-              if (!String(e.message || e).includes("not_authed")) throw e;
-              await ensureAuthorized();
-              res = await finishRemote(transferId, name, mime, env);
-            }
-            hideProgress();
-            setStatus(
-              `✅ Decoded "${res?.name || name}" (id ${res?.id || "pending"}).`
-            );
+            const { name, payload } = parseEnvelope(raw);
+            await processRemote(name, payload);
           } catch (e) {
             console.error(e);
             const msg = e && e.message ? e.message : String(e);
@@ -418,34 +356,20 @@
             }
             const filename = getDesiredFilename();
             setStatus("Submitting markdown…");
-            const res = await sendMarkdown(filename, markdown);
+            const result = await sendMarkdown(filename, markdown);
             setStatus(
-              `✅ Uploaded "${res?.name || name}" (id ${res?.id || "pending"}).`
+              `✅ Uploaded "${result?.name || filename}" (id ${
+                result?.id || "pending"
+              }).`
             );
           } catch (e) {
             console.error(e);
-            setStatus("Error: " + (e.message || e));
+            const msg = e && e.message ? e.message : String(e);
+            setStatus("Error: " + msg);
           } finally {
             setBusy(false);
             refreshUI();
           }
-        }
-
-        function normalizeB64(text) {
-          let payload = (text || "").trim();
-          const comma = payload.indexOf(",");
-          payload =
-            comma >= 0 && payload.startsWith("data:")
-              ? payload.slice(comma + 1)
-              : payload;
-          payload = payload
-            .replace(/[^0-9A-Za-z+/=_-]/g, "")
-            .replace(/-/g, "+")
-            .replace(/_/g, "/");
-          const rem = payload.length % 4;
-          if (rem === 1) throw new Error("Payload is corrupt.");
-          if (rem && rem < 4) payload += "=".repeat(4 - rem);
-          return payload;
         }
 
         async function sendMarkdown(filename, markdown, attemptedAuth = false) {
@@ -484,39 +408,43 @@
           return ph || "document.docx";
         }
 
-        async function chunkedSend(payloadBytes, onProgress) {
+        async function processRemote(name, payload) {
+          showProgress(0);
+          const transferId = await chunkedSend(payload, (p) => {
+            showProgress(p);
+            setStatus(`Decoding ${(p * 100).toFixed(1)}% (${name})…`);
+          });
+          let res;
+          try {
+            res = await finishRemote(transferId, name);
+          } catch (e) {
+            if (!String(e.message || e).includes("not_authed")) throw e;
+            await ensureAuthorized();
+            res = await finishRemote(transferId, name);
+          }
+          hideProgress();
+          setStatus(
+            `✅ Decoded "${res?.name || name}" (id ${res?.id || "pending"}).`
+          );
+        }
+
+        async function chunkedSend(payloadText, onProgress) {
           const start = await fetch("/api/chunk/start", {
             method: "POST",
             credentials: "include",
           });
-            const sjs = await start.json();
-            const transferId = sjs[TRANSFER_FIELD];
-            console.log("[b64drive] chunk/start ok:", transferId);
-
-          const total = payloadBytes.byteLength;
+          const sjs = await start.json();
+          const transferId = sjs[TRANSFER_FIELD];
+          const CHUNK = 512 * 1024;
+          const total = payloadText.length;
           let seq = 0;
-
-          for (let off = 0; off < total; off += CHUNK_SIZE) {
-            const data = payloadBytes.slice(
-              off,
-              Math.min(total, off + CHUNK_SIZE)
-            );
-            console.log("[b64drive] chunk/append", {
-              seq,
-              transferId,
-              off,
-              chunkLen: data.byteLength,
-              total,
-            });
+          for (let off = 0; off < total; off += CHUNK) {
+            const data = payloadText.slice(off, Math.min(total, off + CHUNK));
             const resp = await fetch("/api/chunk/append", {
               method: "POST",
-              headers: {
-                "Content-Type": "application/octet-stream",
-                "Upload-Id": transferId,
-                "Upload-Seq": String(seq),
-              },
+              headers: { "Content-Type": "application/json" },
               credentials: "include",
-              body: data,
+              body: JSON.stringify({ [TRANSFER_FIELD]: transferId, seq, data }),
             });
             const js = await resp.json();
             if (!resp.ok || !js?.ok)
@@ -525,36 +453,21 @@
             if (onProgress)
               onProgress(Math.min(1, (off + data.length) / total));
           }
-          console.log("[b64drive] chunkedSend loop done, chunks sent:", seq);
           return transferId;
         }
 
-        async function finishRemote(transferId, name, mime, env) {
-          console.log("[b64drive] finishRemote payload:", {
-            transferId,
-            name,
-            mime,
-            encrypted: !!env.encrypted,
-            hasHeader: !!env.headerB64,
-            hasSig: !!env.sigB64,
-          });
+        async function finishRemote(transferId, name) {
+          const mime = "application/octet-stream";
           const resp = await fetch(FINISH_PATH, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             credentials: "include",
-            body: JSON.stringify({
-              [TRANSFER_FIELD]: transferId,
-              name,
-              mime,
-              encrypted: !!env.encrypted,
-              enc_header_b64: env.headerB64 || null,
-              sig_b64: env.sigB64 || null,
-            }),
+            body: JSON.stringify({ [TRANSFER_FIELD]: transferId, name, mime }),
           });
           const js = await resp.json().catch(() => ({}));
-          console.log("[b64drive] finishRemote response:", resp.status, js);
-          if (!resp.ok || !js?.ok)
+          if (!resp.ok || !js?.ok) {
             throw new Error(js?.error || resp.statusText || "finish failed");
+          }
           return js;
         }
 
@@ -563,7 +476,10 @@
             try {
               return await navigator.clipboard.readText();
             } catch (e) {
-              console.warn("Read failed, falling back to manual.", e);
+              console.warn(
+                "Read failed, falling back to manual.",
+                e
+              );
             }
           }
           return openPasteOverlay();
@@ -571,39 +487,33 @@
 
         function parseEnvelope(raw) {
           const trimmed = raw.trim();
+          const match = /^FILENAME:([^\r\n]+)\r?\n([\s\S]*)$/i.exec(trimmed);
+          if (match) {
+            return {
+              name: match[1].trim(),
+              payload: normalizePayload(match[2].trim()),
+            };
+          }
+          return { name: "file.bin", payload: normalizePayload(trimmed) };
+        }
 
-          // ENCV3 format:
-          // ENCV3:<headerB64>
-          // SIG:<sigB64>
-          // <cipherB64>
-          const m = /ENCV3:([^\r\n]+)\r?\nSIG:([^\r\n]+)\r?\n([\s\S]+)/i.exec(
-            trimmed
-          );
-          if (!m) throw new Error("Invalid payload: expected ENCV3 envelope.");
-
-          const headerB64 = m[1].trim();
-          const sigB64 = m[2].trim();
-          const cipherB64 = normalizeB64(m[3]);
-
-          // If we can decode header, prefer embedded filename as default.
-          let embeddedName = "";
-          let embeddedMime = "";
-          try {
-            const headerJson = JSON.parse(
-              new TextDecoder().decode(b64ToBytes(headerB64))
+        function normalizePayload(text) {
+          const comma = text.indexOf(",");
+          let payload =
+            comma >= 0 && text.startsWith("data:")
+              ? text.slice(comma + 1)
+              : text;
+          payload = payload
+            .replace(/[^0-9A-Za-z+/=_-]/g, "")
+            .replace(/-/g, "+")
+            .replace(/_/g, "/");
+          const rem = payload.length % 4;
+          if (rem === 1)
+            throw new Error(
+              "Payload is corrupt."
             );
-            embeddedName = headerJson?.filename || "";
-            embeddedMime = headerJson?.mime || "";
-          } catch {}
-
-          return {
-            encrypted: true,
-            name: embeddedName || "file.bin",
-            mime: embeddedMime || "application/octet-stream",
-            headerB64,
-            sigB64,
-            cipherBytes: b64ToBytes(cipherB64),
-          };
+          if (rem && rem < 4) payload += "=".repeat(4 - rem);
+          return payload;
         }
 
         function openPasteOverlay() {
@@ -641,11 +551,7 @@
           setStatus("Authorization required…");
           let popup = null;
           try {
-            popup = window.open(
-              "/oauth/start",
-              "auth_window",
-              "width=500,height=650"
-            );
+            popup = window.open("/oauth/start", "auth_window", "width=500,height=650");
           } catch {
             location.href = "/oauth/start";
             return new Promise(() => {});
@@ -674,13 +580,6 @@
           throw new Error("authorization_timeout");
         }
 
-        function getDesiredFilename() {
-          const raw = filenameInput.value.trim();
-          if (raw) return raw;
-          const ph = filenameInput.getAttribute("placeholder");
-          return ph || "document.docx";
-        }
-
         function toPayload(file) {
           return new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -696,58 +595,6 @@
             };
             reader.readAsDataURL(file);
           });
-        }
-
-        // ── Key import helpers (WebCrypto) ─────────────────────────────────────
-        async function importRsaOaepPublicKey(pem) {
-          const der = pemToDer(pem);
-          return crypto.subtle.importKey(
-            "spki",
-            der,
-            { name: "RSA-OAEP", hash: "SHA-256" },
-            false,
-            ["encrypt"]
-          );
-        }
-
-        async function importEd25519PrivateKey(pem) {
-          const der = pemToDer(pem);
-          return crypto.subtle.importKey(
-            "pkcs8",
-            der,
-            { name: "Ed25519" },
-            false,
-            ["sign"]
-          );
-        }
-
-        function pemToDer(pem) {
-          const b64 = pem
-            .replace(/-----BEGIN [^-]+-----/g, "")
-            .replace(/-----END [^-]+-----/g, "")
-            .replace(/\s+/g, "");
-          return b64ToBytes(b64).buffer;
-        }
-
-        function bytesToB64(bytes) {
-          const u8 =
-            bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-          let binary = "";
-          const chunk = 0x8000;
-          for (let i = 0; i < u8.length; i += chunk) {
-            binary += String.fromCharCode.apply(
-              null,
-              u8.subarray(i, i + chunk)
-            );
-          }
-          return btoa(binary);
-        }
-
-        function b64ToBytes(b64) {
-          const bin = atob(b64);
-          const out = new Uint8Array(bin.length);
-          for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-          return out;
         }
 
         async function copyText(text) {
@@ -766,27 +613,6 @@
 
         function setStatus(msg) {
           statusEl.textContent = msg;
-        }
-
-        function announceChunkPlan(totalBytes, name) {
-          const chunkCount = Math.max(1, Math.ceil(totalBytes / CHUNK_SIZE));
-          const etaSeconds = estimateDurationSeconds(chunkCount);
-          const formattedEta =
-            etaSeconds >= 90
-              ? `${Math.round(etaSeconds / 60)}m`
-              : `${etaSeconds}s`;
-          const heading = `Preparing to decode ${name} (${formatBytes(
-            totalBytes
-          )}).`;
-          const chunkLine = `Chunks: ${chunkCount} × ${formatBytes(
-            CHUNK_SIZE
-          )}.`;
-          const etaLine =
-            "Estimated time: ~" +
-            `${formattedEta} (info shown before uploads start).`;
-          setStatus([heading, chunkLine, etaLine].join("\n"));
-          showProgress(0);
-          return { chunkCount, etaSeconds };
         }
 
         function setBusy(busy) {
@@ -809,11 +635,11 @@
             mode === "server" && state.serverAvailable ? "server" : "client";
           if (state.mode !== next) {
             state.mode = next;
-            setStatus(
-              next === "server"
-                ? "Ready. Press Submit."
-                : "Pick a file and it will decode immediately."
-            );
+            if (next === "server") {
+              setStatus("Ready. Press Submit.");
+            } else {
+              setStatus("Pick a file and it will decode immediately.");
+            }
           }
           refreshUI();
         }
@@ -830,6 +656,9 @@
             !serverMode || state.busy || !state.serverAvailable;
           filenameInput.disabled = !serverMode || state.busy;
           fileInput.disabled = state.busy || serverMode;
+          const needsAuth = state.serverAvailable && !state.authed;
+          authorizeBtn.hidden = !needsAuth;
+          authorizeBtn.disabled = state.busy;
         }
 
         function formatBytes(bytes) {
@@ -844,18 +673,6 @@
 
         function sleep(ms) {
           return new Promise((resolve) => setTimeout(resolve, ms));
-        }
-
-        function waitForPaint() {
-          return new Promise((resolve) => {
-            const fn = typeof requestAnimationFrame === "function" ? requestAnimationFrame : setTimeout;
-            fn(() => resolve(), 16);
-          });
-        }
-
-        function estimateDurationSeconds(chunks) {
-          const assumedChunksPerSecond = 3; // conservative to remain visible on slow clients
-          return Math.max(1, Math.ceil(chunks / assumedChunksPerSecond));
         }
       })();
     </script>

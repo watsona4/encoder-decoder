@@ -5,14 +5,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl pandoc && rm -rf /var/lib/apt/lists/*
+    ca-certificates curl pandoc openssl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py index.html ./
+COPY server.py index.html index_simple.html ./
 
 EXPOSE 8000
 

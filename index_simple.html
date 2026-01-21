@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Clipboard CMS Upload</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        min-height: 100vh;
+        margin: 0;
+        background: #0b1221;
+        color: #f5f5f5;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      main {
+        width: min(520px, 100%);
+        background: rgba(10, 14, 25, 0.92);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 16px;
+        padding: 28px;
+        box-shadow: 0 20px 65px rgba(0, 0, 0, 0.45);
+      }
+      h1 {
+        margin-top: 0;
+        font-size: 1.5rem;
+      }
+      label {
+        display: block;
+        margin-bottom: 8px;
+        font-size: 0.95rem;
+      }
+      input[type="text"] {
+        width: 100%;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.3);
+        background: rgba(255, 255, 255, 0.05);
+        color: inherit;
+        font-size: 1rem;
+      }
+      button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        border: 0;
+        border-radius: 10px;
+        background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+        color: #fff;
+        padding: 10px 18px;
+        font-size: 1rem;
+        cursor: pointer;
+        margin-top: 16px;
+        width: 100%;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      progress {
+        width: 100%;
+        height: 10px;
+        margin: 16px 0;
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      progress::-webkit-progress-bar {
+        background: rgba(255, 255, 255, 0.15);
+      }
+      progress::-webkit-progress-value {
+        background: linear-gradient(90deg, #22d3ee, #2563eb);
+      }
+      progress::-moz-progress-bar {
+        background: linear-gradient(90deg, #22d3ee, #2563eb);
+      }
+      pre {
+        margin: 0;
+        background: rgba(0, 0, 0, 0.25);
+        border-radius: 10px;
+        padding: 16px;
+        min-height: 120px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        white-space: pre-wrap;
+      }
+      p.helper {
+        font-size: 0.95rem;
+        color: rgba(255, 255, 255, 0.8);
+        margin-top: 0;
+      }
+      .overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.65);
+        display: grid;
+        place-items: center;
+        z-index: 9999;
+      }
+      .panel {
+        background: #0f172a;
+        border-radius: 14px;
+        padding: 24px;
+        width: min(360px, 90vw);
+        color: #f8fafc;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5);
+      }
+      .panel h2 {
+        margin: 0 0 8px;
+        font-size: 1.1rem;
+      }
+      .panel p {
+        margin-top: 0;
+        color: rgba(248, 250, 252, 0.75);
+        font-size: 0.95rem;
+      }
+      .panel input[type="password"] {
+        width: 100%;
+        padding: 10px;
+        border-radius: 8px;
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        background: rgba(15, 23, 42, 0.7);
+        color: #f8fafc;
+        font-size: 1rem;
+        margin-top: 8px;
+      }
+      .panel .actions {
+        display: flex;
+        gap: 12px;
+        margin-top: 16px;
+        justify-content: flex-end;
+      }
+      .panel button {
+        flex: 0 0 auto;
+        min-width: 90px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Clipboard Payload Upload</h1>
+      <p class="helper">
+        Open the generated <code>pkg-*.bundle.txt</code>, copy the entire file
+        contents to your clipboard, optionally enter a Drive filename override
+        (leave blank to use the embedded original name), then click
+        the button. The bundle is sent in 512&nbsp;KB chunks, decrypted,
+        signature-verified, decompressed, and uploaded.
+      </p>
+      <label for="filename">Drive filename</label>
+      <input
+        id="filename"
+        type="text"
+        placeholder="Optional override (default uses original filename)"
+      />
+      <button type="button" id="upload-btn">Paste &amp; Upload</button>
+      <progress id="progress" value="0" max="1" hidden></progress>
+      <pre id="log">Waiting for clipboard payload…</pre>
+    </main>
+    <script>
+      (() => {
+        const CHUNK_SIZE = 512 * 1024; // 512 KB chunks
+        const uploadBtn = document.getElementById("upload-btn");
+        const filenameInput = document.getElementById("filename");
+        const logEl = document.getElementById("log");
+        const progressEl = document.getElementById("progress");
+        let busy = false;
+        const logLines = [];
+        const textEncoder = new TextEncoder();
+
+        function bytesToBase64(bytes) {
+          let binary = "";
+          const chunkSize = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunkSize) {
+            const chunk = bytes.subarray(i, i + chunkSize);
+            binary += String.fromCharCode.apply(null, chunk);
+          }
+          return btoa(binary);
+        }
+
+        function formatMb(length) {
+          return (length / (1024 * 1024)).toFixed(2);
+        }
+
+        async function streamUpload(rawText, uploadId, approxChunks) {
+          const TEXT_SLICE = 256 * 1024;
+          const totalChars = rawText.length;
+          let processedChars = 0;
+          let seq = 0;
+          let pendingBase64 = "";
+          let leftover = new Uint8Array(0);
+
+          async function flushFullChunks() {
+            while (pendingBase64.length >= CHUNK_SIZE) {
+              const chunk = pendingBase64.slice(0, CHUNK_SIZE);
+              pendingBase64 = pendingBase64.slice(CHUNK_SIZE);
+              await appendChunk(uploadId, seq, chunk);
+              seq += 1;
+              const totalGuess = Math.max(seq, approxChunks);
+              pushLog(`Sent chunk ${seq}/${totalGuess}`);
+            }
+          }
+
+          for (let offset = 0; offset < totalChars; offset += TEXT_SLICE) {
+            const slice = rawText.slice(offset, offset + TEXT_SLICE);
+            const bytes = textEncoder.encode(slice);
+            let merged = bytes;
+            if (leftover.length) {
+              merged = new Uint8Array(leftover.length + bytes.length);
+              merged.set(leftover, 0);
+              merged.set(bytes, leftover.length);
+            }
+            const usableLen = Math.floor(merged.length / 3) * 3;
+            if (usableLen > 0) {
+              const toEncode = merged.subarray(0, usableLen);
+              pendingBase64 += bytesToBase64(toEncode);
+              leftover = merged.subarray(usableLen);
+            } else {
+              leftover = merged;
+            }
+            await flushFullChunks();
+            processedChars += slice.length;
+            progressEl.value = Math.min(1, processedChars / totalChars);
+            if (processedChars % (TEXT_SLICE * 4) === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+          }
+          if (leftover.length) {
+            pendingBase64 += bytesToBase64(leftover);
+            leftover = new Uint8Array(0);
+          }
+          await flushFullChunks();
+          if (pendingBase64.length) {
+            await appendChunk(uploadId, seq, pendingBase64);
+            seq += 1;
+            const totalGuess = Math.max(seq, approxChunks);
+            pushLog(`Sent chunk ${seq}/${totalGuess}`);
+          }
+        }
+
+        async function readClipboardWithFallback(timeoutMs = 4000) {
+          if (!navigator.clipboard || !navigator.clipboard.readText) {
+            return openPasteOverlay();
+          }
+          let timeoutHandle;
+          const timeoutPromise = new Promise((_, reject) => {
+            timeoutHandle = setTimeout(
+              () => reject(new Error("clipboard_timeout")),
+              timeoutMs,
+            );
+          });
+          try {
+            const text = await Promise.race([navigator.clipboard.readText(), timeoutPromise]);
+            clearTimeout(timeoutHandle);
+            return text;
+          } catch (err) {
+            clearTimeout(timeoutHandle);
+            pushLog("Clipboard API stalled; please paste the bundle manually.");
+            return openPasteOverlay();
+          }
+        }
+
+        function openPasteOverlay() {
+          return new Promise((resolve, reject) => {
+            const overlay = document.createElement("div");
+            overlay.className = "overlay";
+            const panel = document.createElement("div");
+            panel.className = "panel";
+            panel.innerHTML = `
+              <h2>Paste Bundle</h2>
+              <p>Press Ctrl/⌘+V to paste the payload, or Esc to cancel.</p>
+            `;
+            const info = document.createElement("p");
+            info.style.color = "#444";
+            info.style.marginTop = "8px";
+            info.textContent = "Your text stays in this page only.";
+            panel.appendChild(info);
+            overlay.appendChild(panel);
+            document.body.appendChild(overlay);
+
+            function cleanup(val, isReject) {
+              overlay.remove();
+              window.removeEventListener("keydown", onKey);
+              if (isReject) {
+                reject(val);
+              } else {
+                resolve(val);
+              }
+            }
+
+            function onKey(e) {
+              if (e.key === "Escape") {
+                cleanup(new Error("cancelled"), true);
+              }
+            }
+
+            overlay.addEventListener("paste", (e) => {
+              e.preventDefault();
+              const text = e.clipboardData.getData("text");
+              cleanup(text || "", false);
+            });
+            window.addEventListener("keydown", onKey);
+            overlay.tabIndex = -1;
+            overlay.focus();
+          });
+        }
+
+        const mimeByExt = {
+          ".bin": "application/octet-stream",
+          ".doc": "application/msword",
+          ".docx":
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          ".pdf": "application/pdf",
+          ".pptx":
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+          ".txt": "text/plain",
+          ".xlsx":
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          ".zip": "application/zip",
+        };
+
+        function pushLog(message) {
+          const stamp = new Date().toLocaleTimeString();
+          logLines.push(`[${stamp}] ${message}`);
+          logEl.textContent = logLines.slice(-12).join("\n");
+        }
+
+        function setBusy(state) {
+          busy = state;
+          uploadBtn.disabled = state;
+          progressEl.hidden = !state;
+          if (!state) {
+            progressEl.value = 0;
+            progressEl.max = 1;
+          }
+        }
+
+        function guessMime(name) {
+          const match = name?.match(/(\.[^.]+)$/);
+          if (!match) return "application/octet-stream";
+          return mimeByExt[match[1].toLowerCase()] || "application/octet-stream";
+        }
+
+        async function startUploadSession() {
+          const resp = await fetch("/api/chunk/start", { method: "POST" });
+          const data = await resp.json();
+          if (!resp.ok || !data.ok) {
+            throw new Error(data.error || "chunk_start failed");
+          }
+          return data.upload_id;
+        }
+
+        async function appendChunk(uploadId, seq, data) {
+          const resp = await fetch("/api/chunk/append", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ upload_id: uploadId, seq, data }),
+          });
+          const body = await resp.json();
+          if (!resp.ok || !body.ok) {
+            throw new Error(body.error || "chunk_append failed");
+          }
+        }
+
+        async function finishUpload(uploadId, name, mime, passphrase) {
+          const resp = await fetch("/api/chunk/finish/drive", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              upload_id: uploadId,
+              name,
+              mime,
+              bundle_payload: true,
+              passphrase: passphrase || undefined,
+            }),
+          });
+          const body = await resp.json();
+          if (!resp.ok || !body.ok) {
+            const err = new Error(body.error || "finish failed");
+            err.code = body.error;
+            throw err;
+          }
+          return body;
+        }
+
+        function requestPassphrase(message) {
+          return new Promise((resolve) => {
+            const overlay = document.createElement("div");
+            overlay.className = "overlay";
+            const panel = document.createElement("div");
+            panel.className = "panel";
+            const instructions =
+              message ||
+              "Enter the passphrase for the recipient private key. It will never be logged.";
+            panel.innerHTML = `
+              <h2>Private Key Passphrase</h2>
+              <p>${instructions}</p>
+              <input type="password" placeholder="Passphrase" />
+              <div class="actions">
+                <button type="button" data-action="cancel">Cancel</button>
+                <button type="button" data-action="submit">Submit</button>
+              </div>
+            `;
+            const input = panel.querySelector("input");
+            const submitBtn = panel.querySelector('[data-action="submit"]');
+            const cancelBtn = panel.querySelector('[data-action="cancel"]');
+
+            function cleanup(value) {
+              document.body.removeChild(overlay);
+              resolve(value);
+            }
+
+            function handleSubmit() {
+              const val = input.value.trim();
+              cleanup(val || null);
+            }
+
+            function handleCancel() {
+              cleanup(null);
+            }
+
+            submitBtn.addEventListener("click", handleSubmit);
+            cancelBtn.addEventListener("click", handleCancel);
+            overlay.addEventListener("keydown", (evt) => {
+              if (evt.key === "Enter") {
+                evt.preventDefault();
+                handleSubmit();
+              } else if (evt.key === "Escape") {
+                evt.preventDefault();
+                handleCancel();
+              }
+            });
+            overlay.appendChild(panel);
+            document.body.appendChild(overlay);
+            overlay.tabIndex = -1;
+            overlay.focus();
+            input.focus();
+          });
+        }
+
+        async function uploadFromClipboard() {
+          if (busy) return;
+          setBusy(true);
+          try {
+            pushLog("Reading clipboard text…");
+            const raw = await readClipboardWithFallback();
+            if (!raw || !raw.trim()) {
+              throw new Error("Clipboard is empty.");
+            }
+            const blobSize = Math.max(1, new Blob([raw]).size);
+            const approxBase64Size = Math.ceil(blobSize / 3) * 4;
+            const approxChunks =
+              Math.max(1, Math.ceil(approxBase64Size / CHUNK_SIZE));
+            pushLog(
+              `Captured bundle (${formatMb(blobSize)} MB text, ~${formatMb(
+                approxBase64Size,
+              )} MB base64).`,
+            );
+            const uploadId = await startUploadSession();
+            pushLog(`Upload session started: ${uploadId}`);
+            progressEl.max = 1;
+            progressEl.value = 0;
+            await streamUpload(raw, uploadId, approxChunks);
+            progressEl.value = 1;
+            const desiredName = filenameInput.value.trim();
+            const uploadName = desiredName || "clipboard.bin";
+            const mime = guessMime(uploadName);
+            pushLog("Finalizing upload on server…");
+            let result;
+            let passphrase = null;
+            while (true) {
+              try {
+                result = await finishUpload(uploadId, uploadName, mime, passphrase);
+                break;
+              } catch (err) {
+                if (
+                  err.code === "passphrase_required" ||
+                  err.code === "passphrase_incorrect"
+                ) {
+                  const promptMessage =
+                    err.code === "passphrase_incorrect"
+                      ? "Vault password was incorrect. Enter it again:"
+                      : "This bundle requires a vault password. Enter it:";
+                  const next = await requestPassphrase(promptMessage);
+                  if (!next) {
+                    pushLog("Upload cancelled — no password entered.");
+                    throw new Error("passphrase_cancelled");
+                  }
+                  passphrase = next;
+                  continue;
+                }
+                throw err;
+              }
+            }
+            passphrase = null;
+            pushLog(
+              `Upload complete: ${uploadName} (Drive id: ${
+                result.id || "unknown"
+              }).`,
+            );
+          } catch (err) {
+            if ((err && err.message) === "passphrase_cancelled") {
+              pushLog("Upload aborted by user.");
+            } else {
+              pushLog(`Error: ${err.message || err}`);
+            }
+          } finally {
+            setBusy(false);
+          }
+        }
+
+        uploadBtn.addEventListener("click", uploadFromClipboard);
+
+        (async () => {
+          try {
+            const resp = await fetch("/api/status");
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (!data.ok) return;
+            if (data.authed) {
+              pushLog(
+                "Ready. Copy the bundle text, then click Paste & Upload.",
+              );
+            } else {
+              pushLog(
+                "Authorize Drive access from the main page before uploading here.",
+              );
+            }
+          } catch (err) {
+            pushLog("Status check failed; continuing anyway.");
+          }
+        })();
+      })();
+    </script>
+  </body>
+</html>

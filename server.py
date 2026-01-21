@@ -5,27 +5,25 @@ import logging
 import mimetypes
 import os
 import pathlib
-import re
 import secrets
 import shutil
 import subprocess
 import time
 import uuid
+import zipfile
 from urllib.parse import urlencode, urlparse
+import re
 
 import redis
 import requests
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
+import yaml
 from flask import Flask, Response, jsonify, redirect, request, send_from_directory
-from google.auth.transport.requests import Request as GARequest
 from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GARequest
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PORT = int(os.getenv("PORT", "8000"))
-TESTING = os.getenv("UNIT_TESTING", "false").lower() in ("1", "true", "yes")
+BASE_DIR = pathlib.Path(__file__).resolve().parent
 
 # Redis via individual env vars (no local container)
 REDIS_HOST = os.getenv("REDIS_HOST")
@@ -35,77 +33,43 @@ REDIS_USERNAME = os.getenv("REDIS_USERNAME") or None
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 REDIS_SSL = os.getenv("REDIS_SSL", "false").lower() in ("1", "true", "yes")
 
+# Local storage path (replaces Google Drive upload)
+LOCAL_STORAGE_PATH = pathlib.Path(os.getenv("LOCAL_STORAGE_PATH", "/storage"))
+
+# Google OAuth is now optional (keeping for backwards compatibility)
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI", f"http://localhost:{PORT}/oauth/callback")
 
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
-SA_DRIVE_SCOPE = os.getenv("SA_DRIVE_SCOPE", "https://www.googleapis.com/auth/drive")
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
-GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+GOOGLE_DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
 
-# Optional Service Account + target folder support
-GDRIVE_USE_SERVICE_ACCOUNT = os.getenv("GDRIVE_USE_SERVICE_ACCOUNT", "false").lower() in ("1", "true", "yes")
-SA_KEY_FILE = os.getenv("SA_KEY_FILE")  # path to service-account JSON in container
-
-# Drive subfolder for uploads
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # explicit folder id override
-DRIVE_SUBFOLDER_NAME = os.getenv("DRIVE_SUBFOLDER_NAME", "rclone").strip() or "rclone"
-
-# Hybrid encryption / signing keys (server-side)
-PRIVATE_KEY_FILE = os.getenv("PRIVATE_KEY_FILE")  # RSA private key for unwrap (PEM)
-SIGN_PUBLIC_KEY_FILE = os.getenv("SIGN_PUBLIC_KEY_FILE")  # Ed25519 public key for verify (PEM)
-
-if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-    if not TESTING:
-        raise SystemExit("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET")
-    GOOGLE_CLIENT_ID = GOOGLE_CLIENT_ID or "test-client"
-    GOOGLE_CLIENT_SECRET = GOOGLE_CLIENT_SECRET or "test-secret"
+# Google auth is no longer required - files are saved locally
+GOOGLE_AUTH_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
 
 if not REDIS_HOST:
-    if not TESTING:
-        raise SystemExit("Set REDIS_HOST (and optionally REDIS_PORT/DB/USERNAME/PASSWORD/SSL) to use your existing Redis.")
-    REDIS_HOST = "localhost"
+    raise SystemExit("Set REDIS_HOST (and optionally REDIS_PORT/DB/USERNAME/PASSWORD/SSL) to use your existing Redis.")
 
-if TESTING:
-    class _FakeRedis:
-        def __init__(self):
-            self._store = {}
+# Build Redis client
+r = redis.Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=REDIS_DB,
+    username=REDIS_USERNAME,
+    password=REDIS_PASSWORD,
+    ssl=REDIS_SSL,
+    decode_responses=False,  # store tokens as bytes
+    socket_timeout=5,
+    socket_connect_timeout=5,
+)
 
-        def ping(self):
-            return True
-
-        def setex(self, key, ttl, value):
-            self._store[key] = value
-
-        def get(self, key):
-            return self._store.get(key)
-
-        def delete(self, key):
-            self._store.pop(key, None)
-
-    r = _FakeRedis()
-else:
-    # Build Redis client
-    r = redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        username=REDIS_USERNAME,
-        password=REDIS_PASSWORD,
-        ssl=REDIS_SSL,
-        decode_responses=False,  # store tokens as bytes
-        socket_timeout=5,
-        socket_connect_timeout=5,
-    )
-
-    # Test connection early (fail fast)
-    try:
-        r.ping()
-    except Exception as e:
-        raise SystemExit(f"Failed to connect to Redis at {REDIS_HOST}:{REDIS_PORT} db={REDIS_DB} ssl={REDIS_SSL}: {e}")
+# Test connection early (fail fast)
+try:
+    r.ping()
+except Exception as e:
+    raise SystemExit(f"Failed to connect to Redis at {REDIS_HOST}:{REDIS_PORT} db={REDIS_DB} ssl={REDIS_SSL}: {e}")
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 
@@ -115,97 +79,79 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(a
 logger = logging.getLogger("b64drive")
 
 
-def _debug_event(event: str, **kwargs):
-    """Emit a structured debug log if DEBUG is enabled."""
-    if not logger.isEnabledFor(logging.DEBUG):
-        return
-    payload = " ".join(f"{k}={kwargs[k]!r}" for k in sorted(kwargs))
-    logger.debug("%s %s", event, payload.strip())
+class PassphraseRequired(Exception):
+    pass
 
 
-def _token_preview(tok: str | None):
-    if not tok:
-        return None
-    return f"{tok[:6]}...len={len(tok)}"
-
-# ── Key loading (lazy) ────────────────────────────────────────────────────────
-_RSA_PRIVATE = None
-_SIGN_PUB = None
+class PassphraseIncorrect(Exception):
+    pass
 
 
-def _get_rsa_private():
-    global _RSA_PRIVATE
-    if _RSA_PRIVATE is not None:
-        return _RSA_PRIVATE
-    if not PRIVATE_KEY_FILE:
-        raise RuntimeError("PRIVATE_KEY_FILE not set")
-    with open(PRIVATE_KEY_FILE, "rb") as f:
-        _RSA_PRIVATE = load_pem_private_key(f.read(), password=None)
-    return _RSA_PRIVATE
+def _clean_fp_value(val: str):
+    val = (val or "").strip()
+    if "=" in val:
+        val = val.split("=")[-1]
+    return val.strip()
 
 
-def _get_sign_pub():
-    global _SIGN_PUB
-    if _SIGN_PUB is not None:
-        return _SIGN_PUB
-    if not SIGN_PUBLIC_KEY_FILE:
-        raise RuntimeError("SIGN_PUBLIC_KEY_FILE not set")
-    with open(SIGN_PUBLIC_KEY_FILE, "rb") as f:
-        _SIGN_PUB = load_pem_public_key(f.read())
-    return _SIGN_PUB
+def _load_sender_fingerprints():
+    env = ENV_SENDER_CERT_FPS
+    senders = []
+    if env:
+        for idx, entry in enumerate(env.split(","), 1):
+            cleaned = _clean_fp_value(entry)
+            if cleaned:
+                senders.append({"name": f"env_sender_{idx}", "fingerprint": cleaned})
+        return senders
+    if not FINGERPRINTS_FILE.exists():
+        return senders
+    try:
+        data = yaml.safe_load(FINGERPRINTS_FILE.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.warning("Failed to parse fingerprints file %s: %s", FINGERPRINTS_FILE, exc)
+        return senders
+    raw_senders = []
+    if isinstance(data, dict):
+        raw_senders = data.get("senders") or []
+        if not raw_senders and data.get("sender"):
+            raw_senders = [data["sender"]]
+    for idx, entry in enumerate(raw_senders, 1):
+        if isinstance(entry, dict):
+            fingerprint = entry.get("fingerprint") or entry.get("value") or entry.get("sha256")
+            name = entry.get("name") or entry.get("label") or f"sender_{idx}"
+        else:
+            fingerprint = entry
+            name = f"sender_{idx}"
+        fingerprint = _clean_fp_value(fingerprint)
+        if fingerprint:
+            senders.append({"name": name, "fingerprint": fingerprint})
+    return senders
 
+# Optional Service Account + target folder support
+GDRIVE_USE_SERVICE_ACCOUNT = os.getenv("GDRIVE_USE_SERVICE_ACCOUNT", "false").lower() in ("1","true","yes")
+SA_KEY_FILE = os.getenv("SA_KEY_FILE")  # path to service-account JSON in container
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # rclone folder id; required if you want rclone subdir
 
-def _b64d(s: str) -> bytes:
-    return base64.b64decode(s.encode("utf-8"))
-
-
-def _verify_sig_encv3(header_b64: str, sig_b64: str, cipher_b64: str):
-    # Signature is over the exact, stable text:
-    #   "ENCV3:<headerB64>\n<cipherB64>"
-    msg = (f"ENCV3:{header_b64}\n{cipher_b64}").encode("utf-8")
-    sig = _b64d(sig_b64)
-    pub = _get_sign_pub()
-    pub.verify(sig, msg)  # raises on failure
-
-
-def _decrypt_encv3(header: dict, ciphertext: bytes) -> tuple[bytes, str]:
-    if header.get("v") not in (3, "3", None):
-        # still allow missing v for early drafts
-        pass
-    if header.get("wrap") != "RSA-OAEP-SHA256":
-        raise ValueError("unsupported_wrap")
-    if header.get("alg") != "AES-256-GCM":
-        raise ValueError("unsupported_alg")
-    iv = _b64d(header["iv"])
-    wrapped_key = _b64d(header["wrapped_key"])
-    priv = _get_rsa_private()
-    aes_key = priv.decrypt(
-        wrapped_key,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
-    )
-    plain = AESGCM(aes_key).decrypt(iv, ciphertext, None)
-    return plain, (header.get("filename") or "file.bin")
-
+# Bundle decode (Receive-OneBundle equivalent) settings
+BUNDLE_PROCESS_ENABLED = os.getenv("BUNDLE_PROCESS_ENABLED", "true").lower() in ("1", "true", "yes")
+RECIPIENT_PRIVATE_KEY_PATH = pathlib.Path(
+    os.getenv("RECIPIENT_PRIVATE_KEY_PATH", str(BASE_DIR / "keys" / "recipient_private.pem"))
+)
+FINGERPRINTS_FILE = pathlib.Path(os.getenv("FINGERPRINTS_FILE", str(BASE_DIR / "keys" / "fingerprints.yaml")))
+ENV_SENDER_CERT_FPS = os.getenv("EXPECTED_SENDER_CERT_SHA256", "").strip()
+SENDER_FINGERPRINTS = []
+SENDER_FINGERPRINTS = _load_sender_fingerprints()
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
 def get_session_id():
     sid = request.cookies.get("sid")
     if not sid:
         sid = secrets.token_urlsafe(32)
-        _debug_event("sid_generated", sid=_token_preview(sid))
-    else:
-        _debug_event("sid_loaded", sid=_token_preview(sid))
     return sid
 
 
 def redis_key(sid, suffix):
-    key = f"b64drive:{sid}:{suffix}"
-    _debug_event("redis_key", key=key)
-    return key
+    return f"b64drive:{sid}:{suffix}"
 
 
 def save_tokens(sid, tok):
@@ -218,29 +164,15 @@ def save_tokens(sid, tok):
         "token_type": tok.get("token_type", "Bearer"),
     }
     r.setex(redis_key(sid, "tokens"), 60 * 60 * 24 * 30, json.dumps(data).encode())
-    _debug_event(
-        "save_tokens",
-        sid=_token_preview(sid),
-        scope=data["scope"],
-        expires_at=exp,
-        refresh=bool(data["refresh_token"]),
-        access=_token_preview(data["access_token"]),
-    )
 
 
 def load_tokens(sid):
-    key = redis_key(sid, "tokens")
-    raw = r.get(key)
-    if raw:
-        _debug_event("load_tokens_hit", sid=_token_preview(sid), key=key)
-        return json.loads(raw)
-    _debug_event("load_tokens_miss", sid=_token_preview(sid), key=key)
-    return None
+    raw = r.get(redis_key(sid, "tokens"))
+    return json.loads(raw) if raw else None
 
 
 def refresh_access_token(sid, tok):
     if not tok or not tok.get("refresh_token"):
-        _debug_event("refresh_skip", reason="missing_token", sid=_token_preview(sid))
         return None
     p = {
         "client_id": GOOGLE_CLIENT_ID,
@@ -249,49 +181,34 @@ def refresh_access_token(sid, tok):
         "refresh_token": tok["refresh_token"],
     }
     resp = requests.post(GOOGLE_OAUTH_TOKEN_URL, data=p, timeout=20)
-    _debug_event(
-        "refresh_token_response",
-        status=resp.status_code,
-        sid=_token_preview(sid),
-        ok=resp.status_code == 200,
-    )
     if resp.status_code != 200:
         return None
     tr = resp.json()
     if "refresh_token" not in tr:
         tr["refresh_token"] = tok["refresh_token"]
     save_tokens(sid, tr)
-    new_tok = load_tokens(sid)
-    _debug_event("refresh_token_success", sid=_token_preview(sid), has_token=bool(new_tok))
-    return new_tok
-    
+    return load_tokens(sid)
 
 
 def get_valid_access_token(sid):
     tok = load_tokens(sid)
     if not tok:
-        _debug_event("access_token_missing", sid=_token_preview(sid))
         return None
     if int(time.time()) >= tok.get("expires_at", 0):
         tok = refresh_access_token(sid, tok)
         if not tok:
-            _debug_event("access_token_refresh_failed", sid=_token_preview(sid))
             return None
-        _debug_event("access_token_refreshed", sid=_token_preview(sid))
     return tok["access_token"]
-
 
 def get_sa_access_token():
     """Fetch an access token using the service account, scoped to Drive."""
     if not SA_KEY_FILE:
         raise RuntimeError("SA_KEY_FILE not set")
-    _debug_event("sa_token_request", key_file=SA_KEY_FILE)
     creds = service_account.Credentials.from_service_account_file(
         SA_KEY_FILE,
-        scopes=[SA_DRIVE_SCOPE],
+        scopes=["https://www.googleapis.com/auth/drive.file"],
     )
     creds.refresh(GARequest())
-    _debug_event("sa_token_acquired", expires_at=str(creds.expiry))
     return creds.token
 
 
@@ -299,7 +216,6 @@ AUTOLINK_RE = re.compile(r"<([^>\s]+)>")
 
 
 def _has_local_reference(markdown_text):
-    _debug_event("check_local_ref_start", length=len(markdown_text))
     def is_forbidden_target(target):
         target = target.strip()
         if not target:
@@ -321,15 +237,12 @@ def _has_local_reference(markdown_text):
 
     for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", markdown_text):
         if is_forbidden_target(match.group(1)):
-            _debug_event("check_local_ref_image", target=match.group(1))
             return True
     for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", markdown_text):
         if is_forbidden_target(match.group(1)):
-            _debug_event("check_local_ref_link", target=match.group(1))
             return True
     for match in AUTOLINK_RE.finditer(markdown_text):
         if is_forbidden_target(match.group(1)):
-            _debug_event("check_local_ref_autolink", target=match.group(1))
             return True
     include_patterns = (
         re.compile(r"^\s*!include\s+", re.IGNORECASE),
@@ -340,16 +253,12 @@ def _has_local_reference(markdown_text):
     for line in markdown_text.splitlines():
         for pat in include_patterns:
             if pat.search(line):
-                _debug_event("check_local_ref_include", line=line.strip())
                 return True
-    _debug_event("check_local_ref_none")
     return False
 
 
-def make_sid_response(payload, sid=None):
-    if sid is None:
-        sid = get_session_id()
-    _debug_event("make_sid_response", sid=_token_preview(sid), payload_keys=list(payload.keys()))
+def make_sid_response(payload):
+    sid = get_session_id()
     resp = jsonify(payload)
     resp.set_cookie("sid", sid, max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax", path="/")
     return resp, sid
@@ -361,14 +270,18 @@ def index():
     return send_from_directory(".", "index.html")
 
 
+@app.get("/index_simple.html")
+def index_simple():
+    return send_from_directory(".", "index_simple.html")
+
+
 # ── Auth & status ─────────────────────────────────────────────────────────────
 @app.get("/api/status")
 def api_status():
     sid = get_session_id()
-    tok = load_tokens(sid)
-    authed = bool(tok and int(time.time()) < tok.get("expires_at", 0))
-    _debug_event("api_status", sid=_token_preview(sid), authed=authed)
-    resp, sid = make_sid_response({"ok": True, "authed": authed}, sid=sid)
+    # Auth is no longer required - files are saved locally
+    # Always report as authed for backwards compatibility with UI
+    resp, sid = make_sid_response({"ok": True, "authed": True, "storage": "local", "storage_path": str(LOCAL_STORAGE_PATH)})
     return resp
 
 
@@ -389,7 +302,6 @@ def oauth_start():
     }
     url = f"{GOOGLE_OAUTH_AUTH_URL}?{urlencode(q)}"
     resp = redirect(url, 302)
-    _debug_event("oauth_start", sid=_token_preview(sid), state=_token_preview(state), url=url)
     resp.set_cookie("sid", sid, max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax", path="/")
     return resp
 
@@ -410,11 +322,9 @@ def oauth_callback():
         "grant_type": "authorization_code",
     }
     resp = requests.post(GOOGLE_OAUTH_TOKEN_URL, data=d, timeout=20)
-    _debug_event("oauth_callback_response", status=resp.status_code, sid=_token_preview(sid))
     if resp.status_code != 200:
         return f"Token exchange failed: {resp.text}", 400
     save_tokens(sid, resp.json())
-    _debug_event("oauth_callback_success", sid=_token_preview(sid))
     return "<p>Authorized. You can close this tab.</p><script>setTimeout(()=>window.close(),700)</script>"
 
 
@@ -430,119 +340,214 @@ def _sid():
 def _udir(sid, uid):
     d = TMP_ROOT / sid / uid
     d.mkdir(parents=True, exist_ok=True)
-    _debug_event("udir", sid=_token_preview(sid), uid=uid, dir=str(d))
     return d
 
 
-def _payload_path(sid, uid):
-    path = _udir(sid, uid) / "payload.bin"
-    _debug_event("payload_path", sid=_token_preview(sid), uid=uid, path=str(path))
-    return path
+def _b64p(sid, uid):
+    return _udir(sid, uid) / "payload.b64"
 
 
 def _meta(sid, uid):
-    path = _udir(sid, uid) / "meta.json"
-    _debug_event("meta_path", sid=_token_preview(sid), uid=uid, path=str(path))
-    return path
+    return _udir(sid, uid) / "meta.json"
 
 
 @app.post("/api/chunk/start")
 def chunk_start():
     sid = get_session_id()
     uid = uuid.uuid4().hex
-    _debug_event("chunk_start_in", sid=_token_preview(sid), uid=uid)
     dirp = _udir(sid, uid)
     try:
         _meta(sid, uid).write_bytes(json.dumps({"seq": -1}).encode())
-        _payload_path(sid, uid).write_bytes(b"")
+        _b64p(sid, uid).write_bytes(b"")
     except Exception as e:
         logger.exception("chunk_start failed: sid=%s uid=%s dir=%s", sid, uid, dirp)
-        _debug_event("chunk_start_failed", sid=_token_preview(sid), uid=uid, error=str(e))
         return jsonify({"ok": False, "error": f"init_failed: {e}"}), 500
     logger.info("chunk_start ok: sid=%s uid=%s dir=%s", sid, uid, dirp)
-    _debug_event("chunk_start_ok", sid=_token_preview(sid), uid=uid, dir=str(dirp))
-    resp, _ = make_sid_response({"ok": True, "upload_id": uid}, sid=sid)
+    resp, _ = make_sid_response({"ok": True, "upload_id": uid})
+    resp.set_cookie("sid", sid, max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax", path="/")
     return resp
 
 
 @app.post("/api/chunk/append")
 def chunk_append():
     sid = _sid()
-    raw = request.get_data(cache=False) or b""
-    try:
-        b = request.get_json(force=True, silent=True) or {}
-    except Exception:
-        b = {}
-    uid = request.headers.get("Upload-Id") or b.get("upload_id")
-    seq = int(request.headers.get("Upload-Seq") or b.get("seq") or -1)
-    if request.mimetype and "json" in request.mimetype and b.get("data"):
-        try:
-            raw = base64.b64decode(b["data"].encode())
-        except Exception:
-            raw = b""
-    _debug_event(
-        "chunk_append_body",
-        sid=_token_preview(sid),
-        body_keys=list(b.keys()),
-        headers=dict(request.headers),
-        raw_len=len(raw),
-    )
+    b = request.get_json(force=True)
+    uid = b.get("upload_id")
+    seq = int(b.get("seq", -1))
+    data = b.get("data", "")
     logger.debug(
-        "chunk_append in: sid=%s uid=%s seq=%s raw_len=%s", sid, uid, seq, len(raw)
+        "chunk_append in: sid=%s uid=%s seq=%s data_len=%s", sid, uid, seq, len(data) if isinstance(data, str) else -1
     )
-    if not uid or seq < 0 or not raw:
+    if not uid or seq < 0 or not data:
         logger.warning("chunk_append bad_args: sid=%s uid=%s seq=%s", sid, uid, seq)
-        _debug_event("chunk_append_bad_args", sid=_token_preview(sid), uid=uid, seq=seq)
         return jsonify({"ok": False, "error": "bad_args"}), 400
     m = _meta(sid, uid)
     if not m.exists():
         logger.warning("chunk_append unknown_upload: sid=%s uid=%s meta=%s", sid, uid, m)
-        _debug_event("chunk_append_unknown_upload", sid=_token_preview(sid), uid=uid)
         return jsonify({"ok": False, "error": "unknown_upload"}), 404
     meta = json.loads(m.read_bytes() or b"{}")
-    _debug_event("chunk_append_meta", sid=_token_preview(sid), uid=uid, meta=meta)
     exp = meta.get("seq", -1) + 1
     if seq != exp:
         logger.warning("chunk_append out_of_order: sid=%s uid=%s expected=%s got=%s", sid, uid, exp, seq)
-        _debug_event("chunk_append_out_of_order", sid=_token_preview(sid), uid=uid, expected=exp, got=seq)
         return jsonify({"ok": False, "error": f"out_of_order expected {exp} got {seq}"}), 409
-    payload_path = _payload_path(sid, uid)
+    b64p = _b64p(sid, uid)
     try:
-        with open(payload_path, "ab") as f:
-            f.write(raw)
+        with open(b64p, "ab") as f:
+            f.write(data.encode())
+            f.write(b"\n")
         meta["seq"] = seq
         m.write_bytes(json.dumps(meta).encode())
     except Exception as e:
-        logger.exception("chunk_append write_failed: sid=%s uid=%s path=%s", sid, uid, payload_path)
+        logger.exception("chunk_append write_failed: sid=%s uid=%s path=%s", sid, uid, b64p)
         return jsonify({"ok": False, "error": f"write_failed: {e}"}), 500
-    _debug_event(
-        "chunk_append_written",
-        sid=_token_preview(sid),
-        uid=uid,
-        seq=seq,
-        bytes_written=len(raw),
-        file_size=payload_path.stat().st_size if payload_path.exists() else -1,
-    )
     logger.debug(
         "chunk_append ok: sid=%s uid=%s seq=%s path=%s size_now=%s",
         sid,
         uid,
         seq,
-        payload_path,
-        payload_path.stat().st_size if payload_path.exists() else -1,
+        b64p,
+        b64p.stat().st_size if b64p.exists() else -1,
     )
     return jsonify({"ok": True, "next": seq + 1})
+
+
+def _iter_b64_file_decode(p: pathlib.Path):
+    carry = ""
+    with open(p, "rt", encoding="utf-8", errors="ignore") as f:
+        for slab in f:
+            s = carry + slab.strip().replace(" ", "")
+            use = (len(s) // 4) * 4
+            if use:
+                yield base64.b64decode(s[:use])
+                carry = s[use:]
+            else:
+                carry = s
+    if carry:
+        pad = carry + "==="[: (4 - len(carry) % 4) % 4]
+        yield base64.b64decode(pad)
+
+
+def _extract_block(text: str, begin_marker: str, end_marker: str):
+    start = text.find(begin_marker)
+    if start < 0:
+        raise ValueError(f"missing marker: {begin_marker}")
+    start += len(begin_marker)
+    end = text.find(end_marker, start)
+    if end < 0:
+        raise ValueError(f"missing marker: {end_marker}")
+    return text[start:end].strip()
+
+
+def _run_openssl(args, label, input_bytes=None):
+    cmd = ["openssl", *args]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, input=input_bytes)
+    if proc.returncode != 0:
+        err = proc.stderr.decode() or proc.stdout.decode() or str(proc.returncode)
+        raise RuntimeError(f"{label} failed: {err.strip()}")
+    return proc
+
+
+def _normalize_fingerprint(fp: str):
+    return fp.strip().replace(":", "").replace(" ", "").lower()
+
+
+def _verify_sender_fingerprint(cert_path: pathlib.Path):
+    if not SENDER_FINGERPRINTS:
+        return
+    result = _run_openssl(
+        ["x509", "-in", str(cert_path), "-noout", "-fingerprint", "-sha256"],
+        "sender fingerprint",
+    )
+    output = result.stdout.decode().strip()
+    got_raw = output.split("=")[-1].strip() if "=" in output else output
+    got_norm = _normalize_fingerprint(got_raw)
+    expected = {
+        _normalize_fingerprint(entry.get("fingerprint"))
+        for entry in SENDER_FINGERPRINTS
+        if entry.get("fingerprint")
+    }
+    if got_norm not in expected:
+        labels = [
+            f"{entry.get('name') or 'sender'} ({entry.get('fingerprint')})"
+            for entry in SENDER_FINGERPRINTS
+            if entry.get("fingerprint")
+        ]
+        raise RuntimeError(
+            f"sender cert fingerprint mismatch (expected one of {', '.join(labels)}, got {got_raw})"
+        )
+
+
+def _process_bundle_payload(bundle_path: pathlib.Path, workdir: pathlib.Path, passphrase: str | None = None):
+    if not BUNDLE_PROCESS_ENABLED:
+        raise RuntimeError("bundle processing disabled on server")
+    if not RECIPIENT_PRIVATE_KEY_PATH.exists():
+        raise RuntimeError(f"recipient private key missing: {RECIPIENT_PRIVATE_KEY_PATH}")
+    raw_text = bundle_path.read_text(encoding="utf-8", errors="ignore")
+    cert_block = _extract_block(raw_text, "-----BEGIN SENDER SIGNING CERT-----", "-----END SENDER SIGNING CERT-----")
+    payload_block = _extract_block(
+        raw_text, "-----BEGIN ENCRYPTED CMS PAYLOAD-----", "-----END ENCRYPTED CMS PAYLOAD-----"
+    )
+    sender_cert = workdir / "sender_sign_cert.pem"
+    enc_pem = workdir / "payload.enc.cms.pem"
+    signed_pem = workdir / "payload.signed.pem"
+    zip_path = workdir / "payload.zip"
+    sender_cert.write_text(cert_block.strip() + "\n", encoding="utf-8", errors="ignore")
+    enc_pem.write_text(payload_block.strip() + "\n", encoding="utf-8", errors="ignore")
+    _verify_sender_fingerprint(sender_cert)
+    decrypt_args = [
+        "cms",
+        "-decrypt",
+        "-binary",
+        "-inform",
+        "PEM",
+        "-in",
+        str(enc_pem),
+        "-inkey",
+        str(RECIPIENT_PRIVATE_KEY_PATH),
+        "-out",
+        str(signed_pem),
+    ]
+    decrypt_input = None
+    if passphrase:
+        decrypt_args += ["-passin", "stdin"]
+        decrypt_input = (passphrase + "\n").encode()
+    try:
+        _run_openssl(decrypt_args, "cms decrypt", input_bytes=decrypt_input)
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "passphrase" in msg or "password" in msg:
+            if passphrase:
+                raise PassphraseIncorrect("incorrect passphrase") from exc
+            raise PassphraseRequired("passphrase required") from exc
+        raise
+    _run_openssl(
+        ["cms", "-verify", "-binary", "-inform", "PEM", "-in", str(signed_pem), "-CAfile", str(sender_cert), "-out", str(zip_path)],
+        "cms verify",
+    )
+    extract_target = workdir / "bundle_payload.bin"
+    extracted_name = None
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            files = [info for info in zf.infolist() if not info.is_dir()]
+            if not files:
+                raise RuntimeError("zip archive is empty")
+            member = max(files, key=lambda m: m.file_size)
+            data = zf.read(member)
+            extracted_name = pathlib.Path(member.filename).name
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"invalid zip extracted from CMS: {exc}") from exc
+    extract_target.write_bytes(data)
+    return extract_target, extracted_name
 
 
 @app.post("/api/chunk/finish/download")
 def chunk_finish_download():
     sid = _sid()
     b = request.get_json(force=True)
-    _debug_event("finish_download_body", sid=_token_preview(sid), body=b)
     uid = b.get("upload_id")
     name = b.get("name", "file.bin")
     mime = b.get("mime", "application/octet-stream")
-    p = _payload_path(sid, uid) if uid else None
+    p = _b64p(sid, uid) if uid else None
     logger.info(
         "finish_download in: sid=%s uid=%s name=%s mime=%s path=%s exists=%s",
         sid,
@@ -553,24 +558,16 @@ def chunk_finish_download():
         p.exists() if p else False,
     )
     if not uid:
-        _debug_event("finish_download_missing_uid", sid=_token_preview(sid))
         return jsonify({"ok": False, "error": "bad_args"}), 400
     if not p.exists():
         logger.warning("finish_download unknown_upload: sid=%s uid=%s path=%s", sid, uid, p)
-        _debug_event("finish_download_missing_file", sid=_token_preview(sid), uid=uid)
         return jsonify({"ok": False, "error": "unknown_upload"}), 404
     h = {"Content-Type": mime, "Content-Disposition": f'attachment; filename="{name}"'}
-    _debug_event("finish_download_ready", sid=_token_preview(sid), headers=h, path=str(p))
 
     def g():
         try:
-            with open(p, "rb") as f:
-                while True:
-                    chunk = f.read(512 * 1024)
-                    if not chunk:
-                        break
-                    _debug_event("finish_download_stream", chunk=len(chunk))
-                    yield chunk
+            for c in _iter_b64_file_decode(p):
+                yield c
             logger.info("finish_download decode_complete: sid=%s uid=%s", sid, uid)
         finally:
             try:
@@ -578,191 +575,119 @@ def chunk_finish_download():
                 logger.info("finish_download cleanup_ok: sid=%s uid=%s dir=%s", sid, uid, _udir(sid, uid))
             except Exception:
                 logger.exception("finish_download cleanup_failed: sid=%s uid=%s", sid, uid)
-                _debug_event("finish_download_cleanup_failed", sid=_token_preview(sid), uid=uid)
 
     return Response(g(), headers=h)
 
 
 @app.post("/api/chunk/finish/drive")
 def chunk_finish_drive():
+    """Save file to local storage (previously uploaded to Google Drive)."""
     sid = _sid()
-    _debug_event("finish_drive_start", sid=_token_preview(sid), use_sa=GDRIVE_USE_SERVICE_ACCOUNT)
-    # Choose auth mode
-    if GDRIVE_USE_SERVICE_ACCOUNT:
-        try:
-            tok = get_sa_access_token()
-        except Exception as e:
-            logger.exception("service_account_token_failed")
-            return jsonify({"ok": False, "error": f"sa_auth_failed: {e}"}), 500
-    else:
-        tok = get_valid_access_token(sid)
-        if not tok:
-            return jsonify({"ok": False, "error": "not_authed"}), 401
-    _debug_event("finish_drive_token_ready", sid=_token_preview(sid), use_sa=GDRIVE_USE_SERVICE_ACCOUNT)
     b = request.get_json(force=True)
-    _debug_event("finish_drive_body", sid=_token_preview(sid), body_keys=list(b.keys()))
     uid = b.get("upload_id")
-
-    encrypted = bool(b.get("encrypted"))
-    enc_header_b64 = b.get("enc_header_b64")
-    sig_b64 = b.get("sig_b64")
-
     name = b.get("name", "file.bin")
     mime = b.get("mime", "application/octet-stream")
-    p = _payload_path(sid, uid) if uid else None
+    bundle_payload = bool(b.get("bundle_payload"))
+    passphrase = (b.get("passphrase") or "").strip()
+    p = _b64p(sid, uid) if uid else None
     logger.info(
-        "finish_drive in: sid=%s uid=%s encrypted=%s name=%s mime=%s path=%s exists=%s",
+        "finish_drive in: sid=%s uid=%s bundle=%s name=%s mime=%s path=%s exists=%s",
         sid,
         uid,
-        encrypted,
+        bundle_payload,
         name,
         mime,
         p,
         p.exists() if p else False,
     )
-
     if not uid:
-        _debug_event("finish_drive_missing_uid", sid=_token_preview(sid))
         return jsonify({"ok": False, "error": "bad_args"}), 400
     if not p.exists():
         logger.warning("finish_drive unknown_upload: sid=%s uid=%s path=%s", sid, uid, p)
-        _debug_event("finish_drive_missing_file", sid=_token_preview(sid), uid=uid, path=str(p))
         return jsonify({"ok": False, "error": "unknown_upload"}), 404
-    if not encrypted:
-        _debug_event("finish_drive_requires_encrypted", sid=_token_preview(sid))
-        return jsonify({"ok": False, "error": "encryption_required"}), 400
-    if not enc_header_b64 or not sig_b64:
-        _debug_event("finish_drive_missing_enc_params", sid=_token_preview(sid))
-        return jsonify({"ok": False, "error": "missing_enc_params"}), 400
-    out = _udir(sid, uid) / "payload.bin"
+    workdir = _udir(sid, uid)
+    out = workdir / "payload.bin"
     try:
-        raw = p.read_bytes()
-        _debug_event("finish_drive_raw_chunk", size=len(raw))
-
-        cipher_b64 = base64.b64encode(raw).decode("ascii")
-        _verify_sig_encv3(enc_header_b64, sig_b64, cipher_b64)
-        _debug_event("finish_drive_signature_verified", sid=_token_preview(sid))
-
-        header = json.loads(base64.b64decode(enc_header_b64).decode("utf-8"))
-        plain, fname = _decrypt_encv3(header, bytes(raw))
-        _debug_event("finish_drive_decrypt_ok", sid=_token_preview(sid), header_keys=list(header.keys()))
-
-        name = fname or name
-        mime = header.get("mime") or mime
-
         with open(out, "wb") as o:
-            o.write(plain)
-        logger.info(
-            "finish_drive verified+decrypted: sid=%s uid=%s out=%s size=%s", sid, uid, out, out.stat().st_size
-        )
-    except Exception as e:
-        logger.exception("finish_drive decode_or_decrypt_failed: sid=%s uid=%s", sid, uid)
-        _debug_event("finish_drive_decode_failed", sid=_token_preview(sid), error=str(e))
-        if e.__class__.__name__ == "InvalidSignature":
-            return jsonify({"ok": False, "error": "bad_signature"}), 400
-        return jsonify({"ok": False, "error": f"decode_failed: {e}"}), 500
-
-    try:
-        ok, payload = _drive_upload(sid, tok, out, name, mime)
-        _debug_event("finish_drive_upload_result", sid=_token_preview(sid), ok=ok, payload_keys=list(payload.keys()) if isinstance(payload, dict) else None)
-    finally:
-        try:
-            shutil.rmtree(_udir(sid, uid), ignore_errors=True)
-            logger.info("finish_drive cleanup_ok: sid=%s uid=%s", sid, uid)
-        except Exception:
-            logger.exception("finish_drive cleanup_failed: sid=%s uid=%s", sid, uid)
-            _debug_event("finish_drive_cleanup_failed", sid=_token_preview(sid), uid=uid)
-
-    if not ok:
-        _debug_event("finish_drive_upload_failed", sid=_token_preview(sid), payload=payload)
-        return jsonify(payload), 502
-    result = {"ok": True, "id": payload.get("id"), "name": payload.get("name")}
-    _debug_event("finish_drive_response", sid=_token_preview(sid), result=result)
-    return jsonify(result)
-
-
-# ── Drive folder helpers ──────────────────────────────────────────────────────
-_RCLONE_FOLDER_CACHE_KEY = b"b64drive:rclone_folder_id:v1"
-_RCLONE_FOLDER_ID = None
-
-
-def _drive_headers(tok):
-    hdrs = {"Authorization": f"Bearer {tok}"}
-    _debug_event("drive_headers", header_keys=list(hdrs.keys()))
-    return hdrs
-
-
-def _ensure_drive_folder(tok) -> str | None:
-    """Return a folder id to upload into. Prefers DRIVE_FOLDER_ID; else ensures DRIVE_SUBFOLDER_NAME exists."""
-    global _RCLONE_FOLDER_ID
-    if DRIVE_FOLDER_ID:
-        _debug_event("ensure_drive_folder_env", folder=DRIVE_FOLDER_ID)
-        return DRIVE_FOLDER_ID
-
-    if _RCLONE_FOLDER_ID:
-        _debug_event("ensure_drive_folder_cached", folder=_RCLONE_FOLDER_ID)
-        return _RCLONE_FOLDER_ID
-
-    try:
-        cached = r.get(_RCLONE_FOLDER_CACHE_KEY)
-        if cached:
-            _RCLONE_FOLDER_ID = cached.decode("utf-8")
-            _debug_event("ensure_drive_folder_redis_hit", folder=_RCLONE_FOLDER_ID)
-            return _RCLONE_FOLDER_ID
+            for c in _iter_b64_file_decode(p):
+                o.write(c)
+        logger.info("finish_drive decode_done: sid=%s uid=%s out=%s size=%s", sid, uid, out, out.stat().st_size)
     except Exception:
-        pass
+        logger.exception("finish_drive decode_failed: sid=%s uid=%s", sid, uid)
+        return jsonify({"ok": False, "error": "decode_failed"}), 500
+    upload_path = out
+    derived_name = None
+    if bundle_payload:
+        try:
+            upload_path, derived_name = _process_bundle_payload(out, workdir, passphrase=passphrase or None)
+            logger.info(
+                "finish_drive bundle_process_ok: sid=%s uid=%s src=%s out=%s size=%s name=%s",
+                sid,
+                uid,
+                out,
+                upload_path,
+                upload_path.stat().st_size,
+                derived_name,
+            )
+        except PassphraseRequired:
+            return jsonify({"ok": False, "error": "passphrase_required"}), 400
+        except PassphraseIncorrect:
+            return jsonify({"ok": False, "error": "passphrase_incorrect"}), 400
+        except Exception as exc:
+            logger.exception("finish_drive bundle_process_failed: sid=%s uid=%s", sid, uid)
+            return jsonify({"ok": False, "error": f"bundle_process_failed: {exc}"}), 500
+    upload_name = derived_name or (name or "").strip() or "file.bin"
 
-    name = DRIVE_SUBFOLDER_NAME
-    sub_name = name.replace("'", "\\'")
-    q = f"name='{sub_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    params = {"q": q, "fields": "files(id,name)", "spaces": "drive", "pageSize": "10"}
-    resp = requests.get(GOOGLE_DRIVE_FILES_URL, headers=_drive_headers(tok), params=params, timeout=20)
-    _debug_event("ensure_drive_folder_query", status=resp.status_code, has_files=resp.status_code == 200)
-    if resp.status_code == 200:
-        files = (resp.json() or {}).get("files") or []
-        if files:
-            _RCLONE_FOLDER_ID = files[0]["id"]
-            try:
-                r.setex(_RCLONE_FOLDER_CACHE_KEY, 60 * 60 * 24, str(_RCLONE_FOLDER_ID).encode())
-            except Exception:
-                pass
-            _debug_event("ensure_drive_folder_exists", folder=_RCLONE_FOLDER_ID)
-            return _RCLONE_FOLDER_ID
+    # Save to local storage instead of Google Drive
+    ok, payload = _local_save(upload_path, upload_name)
+    try:
+        shutil.rmtree(_udir(sid, uid), ignore_errors=True)
+        logger.info("finish_drive cleanup_ok: sid=%s uid=%s", sid, uid)
+    except Exception:
+        logger.exception("finish_drive cleanup_failed: sid=%s uid=%s", sid, uid)
+    if not ok:
+        return jsonify(payload), 500
+    return jsonify({"ok": True, "id": payload.get("id"), "name": payload.get("name"), "path": payload.get("path")})
 
-    # Create folder
-    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
-    cresp = requests.post(
-        GOOGLE_DRIVE_FILES_URL,
-        headers={**_drive_headers(tok), "Content-Type": "application/json"},
-        data=json.dumps(meta).encode(),
-        timeout=20,
-    )
-    if cresp.status_code in (200, 201):
-        _RCLONE_FOLDER_ID = (cresp.json() or {}).get("id")
-        if _RCLONE_FOLDER_ID:
-            try:
-                r.setex(_RCLONE_FOLDER_CACHE_KEY, 60 * 60 * 24, _RCLONE_FOLDER_ID.encode())
-            except Exception:
-                pass
-            _debug_event("ensure_drive_folder_created", folder=_RCLONE_FOLDER_ID)
-            return _RCLONE_FOLDER_ID
 
-    logger.warning("could_not_ensure_folder: name=%s status=%s body=%s", name, cresp.status_code, cresp.text[:300])
-    _debug_event("ensure_drive_folder_failed", status=cresp.status_code)
-    return None
+def _local_save(file_path, name):
+    """Save file to local storage directory."""
+    try:
+        # Ensure storage directory exists
+        LOCAL_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+
+        # Sanitize filename - remove path separators
+        safe_name = os.path.basename(name)
+        if not safe_name:
+            safe_name = "file.bin"
+
+        # Handle duplicate filenames by adding a suffix
+        dest_path = LOCAL_STORAGE_PATH / safe_name
+        if dest_path.exists():
+            base, ext = os.path.splitext(safe_name)
+            counter = 1
+            while dest_path.exists():
+                dest_path = LOCAL_STORAGE_PATH / f"{base}_{counter}{ext}"
+                counter += 1
+
+        # Copy file to storage
+        shutil.copy2(file_path, dest_path)
+        file_id = uuid.uuid4().hex
+
+        logger.info("_local_save ok: src=%s dest=%s size=%s", file_path, dest_path, dest_path.stat().st_size)
+        return True, {"id": file_id, "name": dest_path.name, "path": str(dest_path)}
+    except Exception as e:
+        logger.exception("_local_save failed: src=%s name=%s", file_path, name)
+        return False, {"ok": False, "error": f"local_save_failed: {e}"}
 
 
 def _drive_upload(sid, tok, file_path, name, mime):
-    folder_id = _ensure_drive_folder(tok)
+    """Legacy Google Drive upload - kept for backwards compatibility."""
     meta = {"name": name}
-    if folder_id:
-        meta["parents"] = [folder_id]
-    _debug_event("drive_upload_meta", sid=_token_preview(sid), folder=folder_id, mime=mime, size=os.path.getsize(file_path))
-    if not folder_id:
-        _debug_event("drive_upload_no_folder", sid=_token_preview(sid))
-
+    if DRIVE_FOLDER_ID:
+        meta["parents"] = [DRIVE_FOLDER_ID]
     boundary = "bnd" + uuid.uuid4().hex
-    upload_params = {"uploadType": "multipart"}
+    logger.info("_drive_upload: meta=%s", meta)
 
     def multipart():
         yield f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode()
@@ -780,39 +705,24 @@ def _drive_upload(sid, tok, file_path, name, mime):
         "Authorization": f"Bearer {tok}",
         "Content-Type": f"multipart/related; boundary={boundary}",
     }
-    resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, params=upload_params, data=multipart(), timeout=600)
-    _debug_event(
-        "drive_upload_post",
-        status=resp.status_code,
-        name=name,
-        mime=mime,
-        file=str(file_path),
-    )
-    if resp.status_code not in (200, 201) and not GDRIVE_USE_SERVICE_ACCOUNT:
-        _debug_event("drive_upload_retry_needed", status=resp.status_code)
+    resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, data=multipart(), timeout=600)
+    if resp.status_code not in (200, 201):
         new = refresh_access_token(sid, load_tokens(sid) or {})
         if new:
             headers["Authorization"] = f"Bearer {new['access_token']}"
-            resp = requests.post(
-                GOOGLE_DRIVE_UPLOAD_URL, headers=headers, params=upload_params, data=multipart(), timeout=600
-            )
-            _debug_event("drive_upload_retry_response", status=resp.status_code)
-
+            resp = requests.post(GOOGLE_DRIVE_UPLOAD_URL, headers=headers, data=multipart(), timeout=600)
     try:
         info = resp.json()
     except Exception:
         info = {}
     if resp.status_code not in (200, 201):
-        _debug_event("drive_upload_error", status=resp.status_code)
         return False, {"ok": False, "error": f"drive_error {resp.status_code}: {resp.text[:500]}"}
-    _debug_event("drive_upload_success", status=resp.status_code, response_keys=list(info.keys()))
     return True, info
 
 
 @app.post("/api/markdown/convert")
 def markdown_convert():
     sid = _sid()
-    _debug_event("markdown_convert_start", sid=_token_preview(sid))
     tok = get_valid_access_token(sid)
     if not tok:
         return jsonify({"ok": False, "error": "not_authed"}), 401
@@ -822,19 +732,19 @@ def markdown_convert():
         return jsonify({"ok": False, "error": "invalid_json"}), 400
     markdown_text = body.get("markdown") if isinstance(body, dict) else None
     filename = (body.get("filename") or "").strip() if isinstance(body, dict) else ""
-    _debug_event("markdown_convert_body", sid=_token_preview(sid), has_markdown=isinstance(markdown_text, str))
     if not isinstance(markdown_text, str) or not markdown_text.strip():
         return jsonify({"ok": False, "error": "missing_markdown"}), 400
     if _has_local_reference(markdown_text):
         return (
-            jsonify({
-                "ok": False,
-                "error": "local_references_forbidden",
-                "message": "Markdown references local files or include directives, which is not allowed.",
-            }),
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "local_references_forbidden",
+                    "message": "Markdown references local files or include directives, which is not allowed.",
+                }
+            ),
             400,
         )
-
     filename = os.path.basename(filename)
     if not filename:
         filename = "document.docx"
@@ -845,7 +755,6 @@ def markdown_convert():
     workdir = _udir(sid, uid)
     input_md = workdir / "input.md"
     output_file = workdir / f"output{suffix}"
-    _debug_event("markdown_convert_paths", sid=_token_preview(sid), input=str(input_md), output=str(output_file))
     try:
         input_md.write_text(markdown_text, encoding="utf-8")
     except Exception as e:
@@ -853,7 +762,6 @@ def markdown_convert():
         return jsonify({"ok": False, "error": f"write_failed: {e}"}), 500
     try:
         subprocess.run(["pandoc", str(input_md), "-o", str(output_file)], check=True, timeout=300)
-        _debug_event("markdown_convert_pandoc_ok", sid=_token_preview(sid))
     except FileNotFoundError:
         logger.exception("markdown_convert pandoc_missing: sid=%s uid=%s", sid, uid)
         return jsonify({"ok": False, "error": "pandoc_not_found"}), 500
@@ -867,7 +775,6 @@ def markdown_convert():
     if not output_file.exists() or output_file.stat().st_size == 0:
         return jsonify({"ok": False, "error": "conversion_failed"}), 500
     ok, info = _drive_upload(sid, tok, output_file, filename, mime)
-    _debug_event("markdown_convert_drive_upload", sid=_token_preview(sid), ok=ok)
     try:
         shutil.rmtree(workdir, ignore_errors=True)
     except Exception:
@@ -882,20 +789,18 @@ def markdown_convert():
 def chunk_debug():
     sid = _sid()
     base = TMP_ROOT / sid
-    _debug_event("chunk_debug_start", sid=_token_preview(sid), base=str(base), base_exists=base.exists())
     info = []
     if base.exists():
         for uid_dir in base.iterdir():
             if uid_dir.is_dir():
-                payload = _payload_path(sid, uid_dir.name)
+                b64 = _b64p(sid, uid_dir.name)
                 info.append({
                     "uid": uid_dir.name,
                     "meta_exists": (_meta(sid, uid_dir.name)).exists(),
-                    "payload_exists": payload.exists(),
-                    "payload_size": payload.stat().st_size if payload.exists() else 0,
+                    "b64_exists": b64.exists(),
+                    "b64_size": b64.stat().st_size if b64.exists() else 0,
                 })
     logger.info("chunk_debug: sid=%s entries=%s", sid, len(info))
-    _debug_event("chunk_debug_summary", sid=_token_preview(sid), entries=len(info))
     return jsonify({"sid": sid, "root": str(base), "uploads": info})
 
 
