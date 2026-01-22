@@ -540,6 +540,64 @@ def _process_bundle_payload(bundle_path: pathlib.Path, workdir: pathlib.Path, pa
     return extract_target, extracted_name
 
 
+def _convert_msg_to_pdf(msg_path: pathlib.Path, workdir: pathlib.Path) -> pathlib.Path:
+    """Convert Outlook .msg file to PDF using extract-msg + wkhtmltopdf."""
+    import extract_msg
+
+    msg = extract_msg.openMsg(str(msg_path))
+
+    # Build HTML with headers and body
+    html_parts = ['<html><body style="font-family: Arial, sans-serif;">']
+    html_parts.append(f'<p><b>From:</b> {msg.sender or "Unknown"}</p>')
+    html_parts.append(f'<p><b>To:</b> {msg.to or ""}</p>')
+    if msg.cc:
+        html_parts.append(f'<p><b>CC:</b> {msg.cc}</p>')
+    html_parts.append(f'<p><b>Subject:</b> {msg.subject or "(No Subject)"}</p>')
+    html_parts.append(f'<p><b>Date:</b> {msg.date or ""}</p>')
+    html_parts.append('<hr>')
+
+    # Add body (prefer HTML, fallback to plain text)
+    if msg.htmlBody:
+        # Strip outer html/body tags if present, inject into our wrapper
+        body = msg.htmlBody
+        if isinstance(body, bytes):
+            body = body.decode('utf-8', errors='replace')
+        html_parts.append(body)
+    elif msg.body:
+        html_parts.append(f'<pre>{msg.body}</pre>')
+    else:
+        html_parts.append('<p>(No message body)</p>')
+
+    # List attachments at the end
+    if msg.attachments:
+        html_parts.append('<hr><p><b>Attachments:</b></p><ul>')
+        for att in msg.attachments:
+            name = getattr(att, 'longFilename', None) or getattr(att, 'shortFilename', None) or 'unnamed'
+            html_parts.append(f'<li>{name}</li>')
+        html_parts.append('</ul>')
+
+    html_parts.append('</body></html>')
+    html_content = '\n'.join(html_parts)
+
+    # Write HTML to temp file
+    html_path = workdir / "email.html"
+    html_path.write_text(html_content, encoding='utf-8')
+
+    # Convert to PDF with wkhtmltopdf
+    pdf_path = workdir / "email.pdf"
+    subprocess.run(
+        ['wkhtmltopdf', '--quiet', str(html_path), str(pdf_path)],
+        check=True,
+        timeout=120
+    )
+
+    if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+        raise RuntimeError("wkhtmltopdf produced no output")
+
+    msg.close()
+    return pdf_path
+
+
 @app.post("/api/chunk/finish/download")
 def chunk_finish_download():
     sid = _sid()
@@ -637,6 +695,16 @@ def chunk_finish_drive():
             logger.exception("finish_drive bundle_process_failed: sid=%s uid=%s", sid, uid)
             return jsonify({"ok": False, "error": f"bundle_process_failed: {exc}"}), 500
     upload_name = derived_name or (name or "").strip() or "file.bin"
+
+    # Convert .msg to PDF if applicable
+    if upload_name.lower().endswith('.msg'):
+        try:
+            converted_path = _convert_msg_to_pdf(upload_path, workdir)
+            upload_path = converted_path
+            upload_name = pathlib.Path(upload_name).stem + ".pdf"
+            logger.info("msg_to_pdf conversion ok: %s -> %s", name, upload_name)
+        except Exception as e:
+            logger.warning("msg_to_pdf conversion failed, keeping original: %s", e)
 
     # Save to local storage instead of Google Drive
     ok, payload = _local_save(upload_path, upload_name)

@@ -4,3 +4,4 @@ requests==2.32.3
 gunicorn==22.0.0
 google-auth==2.35.0
 PyYAML==6.0.2
+extract-msg>=0.48.0
