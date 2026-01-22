@@ -585,11 +585,16 @@ def _convert_msg_to_pdf(msg_path: pathlib.Path, workdir: pathlib.Path) -> pathli
 
     # Convert to PDF with wkhtmltopdf
     pdf_path = workdir / "email.pdf"
-    subprocess.run(
-        ['wkhtmltopdf', '--quiet', str(html_path), str(pdf_path)],
-        check=True,
+    result = subprocess.run(
+        ['wkhtmltopdf', '--enable-local-file-access', '--load-error-handling', 'ignore',
+         '--load-media-error-handling', 'ignore', str(html_path), str(pdf_path)],
+        capture_output=True,
         timeout=120
     )
+    if result.returncode != 0:
+        stderr = result.stderr.decode('utf-8', errors='replace')
+        # Log warning but check if PDF was still created
+        logger.warning("wkhtmltopdf stderr: %s", stderr[:500])
 
     if not pdf_path.exists() or pdf_path.stat().st_size == 0:
         raise RuntimeError("wkhtmltopdf produced no output")
