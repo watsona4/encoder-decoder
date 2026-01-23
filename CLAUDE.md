@@ -57,8 +57,8 @@ Temporary upload data stored in `/tmp/b64drive/{sid}/{uid}/`.
 
 ### Frontend
 
-- `index.html` - Main UI with drag-and-drop file picker, chunked upload progress, markdown submission
-- `index_simple.html` - Simplified UI for clipboard-based bundle uploads
+- `/` serves `index_simple.html` - Simplified UI for clipboard-based bundle uploads (default)
+- `/index.html` - Full UI with drag-and-drop file picker, chunked upload progress, markdown submission
 
 Both use vanilla JavaScript with no frameworks.
 
@@ -76,12 +76,18 @@ Bundle processing verifies sender against SHA256 fingerprints in `FINGERPRINTS_F
 
 | Variable | Purpose |
 |----------|---------|
+| `BASIC_AUTH_USER` | Username for Basic Auth (required) |
+| `BASIC_AUTH_PASS` | Password for Basic Auth (required) |
 | `REDIS_HOST/PORT/USERNAME/PASSWORD` | Redis connection |
 | `LOCAL_STORAGE_PATH` | File storage directory |
 | `BUNDLE_PROCESS_ENABLED` | Enable CMS decryption |
 | `RECIPIENT_PRIVATE_KEY_PATH` | Server decryption key |
 | `FINGERPRINTS_FILE` | Trusted sender fingerprints (YAML) |
 | `LOG_LEVEL` | Logging verbosity (DEBUG/INFO/etc) |
+
+### Authentication
+
+All endpoints are protected by HTTP Basic Authentication. Set `BASIC_AUTH_USER` and `BASIC_AUTH_PASS` in `.env`. If not configured, a warning is logged and the site runs unprotected.
 
 ## Tech Stack
 
