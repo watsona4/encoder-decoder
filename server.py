@@ -267,12 +267,12 @@ def make_sid_response(payload):
 # ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def index():
-    return send_from_directory(".", "index.html")
-
-
-@app.get("/index_simple.html")
-def index_simple():
     return send_from_directory(".", "index_simple.html")
+
+
+@app.get("/index.html")
+def index_full():
+    return send_from_directory(".", "index.html")
 
 
 # ── Auth & status ─────────────────────────────────────────────────────────────
