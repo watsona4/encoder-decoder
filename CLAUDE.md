@@ -8,6 +8,7 @@ B64Drive ("Decoder Ring") is a secure file transfer application that provides:
 - Chunked file uploads with base64 encoding
 - CMS (Cryptographic Message Syntax) bundle encryption/decryption via OpenSSL
 - Markdown-to-Word/PDF conversion via Pandoc
+- Outlook .msg to PDF conversion via extract-msg + wkhtmltopdf
 - Local file storage (previously Google Drive, migrated Jan 2025)
 
 ## Commands
@@ -49,6 +50,7 @@ Flask application with Redis for session/token storage. Key endpoint groups:
 - **Chunked uploads**: `/api/chunk/start`, `/api/chunk/append`, `/api/chunk/finish/drive`, `/api/chunk/finish/download`
 - **Bundle processing**: CMS decryption with sender certificate verification using OpenSSL subprocess calls
 - **Markdown conversion**: Pandoc integration with security restrictions (blocks local file references and include directives)
+- **MSG conversion**: Auto-converts .msg files to PDF on upload via `_convert_msg_to_pdf()`
 - **Status**: `/api/status` (health check), `/api/chunk/debug` (active uploads)
 
 Temporary upload data stored in `/tmp/b64drive/{sid}/{uid}/`.
@@ -87,4 +89,5 @@ Bundle processing verifies sender against SHA256 fingerprints in `FINGERPRINTS_F
 - Redis for sessions
 - OpenSSL for CMS operations
 - Pandoc for document conversion
+- wkhtmltopdf + extract-msg for .msg to PDF conversion
 - cryptography library for test key generation
