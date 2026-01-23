@@ -78,6 +78,39 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("b64drive")
 
+# ── Basic Authentication ──────────────────────────────────────────────────────
+BASIC_AUTH_USER = os.getenv("BASIC_AUTH_USER", "").strip()
+BASIC_AUTH_PASS = os.getenv("BASIC_AUTH_PASS", "").strip()
+BASIC_AUTH_ENABLED = bool(BASIC_AUTH_USER and BASIC_AUTH_PASS)
+if not BASIC_AUTH_ENABLED:
+    logger.warning("BASIC_AUTH_USER/PASS not set - site is unprotected!")
+
+
+def check_basic_auth():
+    """Check Basic Auth credentials from request."""
+    if not BASIC_AUTH_ENABLED:
+        return True
+    auth = request.authorization
+    if not auth:
+        return False
+    return (secrets.compare_digest(auth.username, BASIC_AUTH_USER) and
+            secrets.compare_digest(auth.password, BASIC_AUTH_PASS))
+
+
+def require_auth(f):
+    """Decorator to require Basic Auth for endpoint access."""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not check_basic_auth():
+            logger.warning("basic_auth failed from %s", request.remote_addr)
+            return Response(
+                "Unauthorized", 401,
+                {"WWW-Authenticate": 'Basic realm="B64Drive"'}
+            )
+        return f(*args, **kwargs)
+    return decorated
+
 
 class PassphraseRequired(Exception):
     pass
@@ -266,17 +299,20 @@ def make_sid_response(payload):
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
+@require_auth
 def index():
     return send_from_directory(".", "index_simple.html")
 
 
 @app.get("/index.html")
+@require_auth
 def index_full():
     return send_from_directory(".", "index.html")
 
 
 # ── Auth & status ─────────────────────────────────────────────────────────────
 @app.get("/api/status")
+@require_auth
 def api_status():
     sid = get_session_id()
     # Auth is no longer required - files are saved locally
@@ -352,6 +388,7 @@ def _meta(sid, uid):
 
 
 @app.post("/api/chunk/start")
+@require_auth
 def chunk_start():
     sid = get_session_id()
     uid = uuid.uuid4().hex
@@ -369,6 +406,7 @@ def chunk_start():
 
 
 @app.post("/api/chunk/append")
+@require_auth
 def chunk_append():
     sid = _sid()
     b = request.get_json(force=True)
@@ -604,6 +642,7 @@ def _convert_msg_to_pdf(msg_path: pathlib.Path, workdir: pathlib.Path) -> pathli
 
 
 @app.post("/api/chunk/finish/download")
+@require_auth
 def chunk_finish_download():
     sid = _sid()
     b = request.get_json(force=True)
@@ -643,6 +682,7 @@ def chunk_finish_download():
 
 
 @app.post("/api/chunk/finish/drive")
+@require_auth
 def chunk_finish_drive():
     """Save file to local storage (previously uploaded to Google Drive)."""
     sid = _sid()
@@ -794,6 +834,7 @@ def _drive_upload(sid, tok, file_path, name, mime):
 
 
 @app.post("/api/markdown/convert")
+@require_auth
 def markdown_convert():
     sid = _sid()
     tok = get_valid_access_token(sid)
@@ -859,6 +900,7 @@ def markdown_convert():
 
 # ── Debug endpoint ────────────────────────────────────────────────────────────
 @app.get("/api/chunk/debug")
+@require_auth
 def chunk_debug():
     sid = _sid()
     base = TMP_ROOT / sid
