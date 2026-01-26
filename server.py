@@ -297,6 +297,12 @@ def make_sid_response(payload):
     return resp, sid
 
 
+# ── Health check (no auth required) ───────────────────────────────────────────
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
 @require_auth
