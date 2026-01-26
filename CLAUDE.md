@@ -51,7 +51,7 @@ Flask application with Redis for session/token storage. Key endpoint groups:
 - **Bundle processing**: CMS decryption with sender certificate verification using OpenSSL subprocess calls
 - **Markdown conversion**: Pandoc integration with security restrictions (blocks local file references and include directives)
 - **MSG conversion**: Auto-converts .msg files to PDF on upload via `_convert_msg_to_pdf()`
-- **Status**: `/api/status` (health check), `/api/chunk/debug` (active uploads)
+- **Status**: `/health` (unauthenticated, for Docker), `/api/status` (authenticated), `/api/chunk/debug` (active uploads)
 
 Temporary upload data stored in `/tmp/b64drive/{sid}/{uid}/`.
 
